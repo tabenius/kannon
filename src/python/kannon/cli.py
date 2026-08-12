@@ -9,6 +9,7 @@ import os
 import pwd
 import re
 import select
+import shlex
 import subprocess
 import shutil
 import sys
@@ -93,6 +94,8 @@ SUPPORTED_EXTENSIONS = (
 )
 CACHE_VERSION = 1
 DOCUMENT_TYPES = "PDF, Markdown, RTF, DOCX, and ODT"
+EDITABLE_TEXT_KINDS = {"markdown", "rtf"}
+SORT_KEYS = ("modified", "created", "title", "path", "kind", "size", "author")
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.per_page < 1:
         raise SystemExit("-n/--per-page must be 1 or greater")
+    if args.ascending and args.descending:
+        raise SystemExit("--ascending and --descending are mutually exclusive")
     paths = [Path(p).expanduser() for p in args.paths] or [Path.cwd()]
     cache_path = Path(args.cache).expanduser()
     if not cache_path.is_absolute():
@@ -149,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         thumbnail_size=args.size,
         refresh=args.refresh,
     )
+    records = sort_records(records, args.sort, descending=not args.ascending)
     save_cache(cache_path, records, args.size)
 
     if args.scan_only:
@@ -226,6 +232,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--grid",
         action="store_true",
         help="Use a 2x2 thumbnail grid. Arrow keys move selection; Space opens metadata.",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=SORT_KEYS,
+        default="modified",
+        help="Sort key for cache and browser order. Default: modified.",
+    )
+    parser.add_argument(
+        "--ascending",
+        action="store_true",
+        help="Sort in ascending order.",
+    )
+    parser.add_argument(
+        "--descending",
+        action="store_true",
+        help="Sort in descending order. This is the default.",
     )
     parser.add_argument(
         "-n",
@@ -420,6 +442,55 @@ def build_records(
             print(format_unexpected_error(document, exc), file=sys.stderr)
             records.append(error_record(document, stat, exc))
     return records
+
+
+def sort_records(records: list[dict[str, Any]], key_name: str, descending: bool) -> list[dict[str, Any]]:
+    if key_name not in SORT_KEYS:
+        raise SystemExit(f"unsupported sort key: {key_name}")
+    return sorted(records, key=lambda record: sort_value(record, key_name), reverse=descending)
+
+
+def sort_value(record: dict[str, Any], key_name: str) -> tuple[int, str | int]:
+    source = record.get("source", {})
+    metadata = record.get("metadata", {})
+    if key_name == "modified":
+        return sortable_datetime(source.get("modified"))
+    if key_name == "created":
+        return sortable_datetime(source.get("created"))
+    if key_name == "title":
+        return sortable_text(record.get("title"))
+    if key_name == "path":
+        return sortable_text(record.get("path") or record.get("path_abs"))
+    if key_name == "kind":
+        return sortable_text(record.get("kind"))
+    if key_name == "size":
+        return sortable_number(source.get("size_bytes"))
+    if key_name == "author":
+        return sortable_text(metadata.get("author") or metadata.get("Author") or metadata.get("creator"))
+    return sortable_text(record.get("path"))
+
+
+def sortable_datetime(value: Any) -> tuple[int, str]:
+    if value is None:
+        return (0, "")
+    text = str(value)
+    if text.endswith(" (ctime)"):
+        text = text.removesuffix(" (ctime)")
+    return (1, text)
+
+
+def sortable_text(value: Any) -> tuple[int, str]:
+    if value is None:
+        return (0, "")
+    text = str(value).casefold()
+    return (1, text)
+
+
+def sortable_number(value: Any) -> tuple[int, int]:
+    try:
+        return (1, int(value))
+    except (TypeError, ValueError):
+        return (0, 0)
 
 
 def record_is_current(record: dict[str, Any], stat: os.stat_result, thumbnail_size: int) -> bool:
@@ -1350,7 +1421,7 @@ def terminal_supports_sixel() -> bool:
 
 def run_tui(records: list[dict[str, Any]], mode: RenderMode, per_page: int, use_nerd: bool) -> None:
     index = 0
-    with RawTerminal():
+    with RawTerminal() as terminal:
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
         try:
@@ -1360,7 +1431,10 @@ def run_tui(records: list[dict[str, Any]], mode: RenderMode, per_page: int, use_
                 if key in {"q", "Q", "\x03", "\x04"}:
                     break
                 if key in {"x", "X"}:
-                    open_record_external(records[index])
+                    open_record_external(records[index], terminal)
+                    continue
+                if key in {"e", "E"}:
+                    edit_record_terminal(records[index], terminal)
                     continue
                 if key in {"right", "down", "j", "n", " "}:
                     index = min(index + per_page, max(0, len(records) - 1))
@@ -1378,7 +1452,7 @@ def run_tui(records: list[dict[str, Any]], mode: RenderMode, per_page: int, use_
 def run_grid_tui(records: list[dict[str, Any]], mode: RenderMode, use_nerd: bool) -> None:
     selected = 0
     show_popup = False
-    with RawTerminal():
+    with RawTerminal() as terminal:
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
         try:
@@ -1394,7 +1468,10 @@ def run_grid_tui(records: list[dict[str, Any]], mode: RenderMode, use_nerd: bool
                     show_popup = not show_popup
                     continue
                 if key in {"x", "X"}:
-                    open_record_external(records[selected])
+                    open_record_external(records[selected], terminal)
+                    continue
+                if key in {"e", "E"}:
+                    edit_record_terminal(records[selected], terminal)
                     continue
                 if show_popup:
                     continue
@@ -1415,20 +1492,21 @@ def run_grid_tui(records: list[dict[str, Any]], mode: RenderMode, use_nerd: bool
             sys.stdout.flush()
 
 
-def open_record_external(record: dict[str, Any]) -> None:
+def open_record_external(record: dict[str, Any], terminal: "RawTerminal | None" = None) -> None:
     path_text = str(record.get("path_abs") or record.get("path") or "")
     path = Path(path_text).expanduser()
     if not path_text:
-        notify_external_open("Cannot open document: this record has no source path.")
+        notify_tui_message("Cannot open document: this record has no source path.", terminal)
         return
     if not path.exists():
-        notify_external_open(f"Cannot open document: {path} does not exist.")
+        notify_tui_message(f"Cannot open document: {path} does not exist.", terminal)
         return
     opener = shutil.which("xdg-open")
     if not opener:
-        notify_external_open(
+        notify_tui_message(
             "Cannot execute xdg-open because it is not installed or not on PATH. "
-            "Install xdg-utils, or open the file manually: " + str(path)
+            "Install xdg-utils, or open the file manually: " + str(path),
+            terminal,
         )
         return
     try:
@@ -1440,28 +1518,108 @@ def open_record_external(record: dict[str, Any]) -> None:
             start_new_session=True,
         )
     except OSError as exc:
-        notify_external_open(f"Cannot execute xdg-open for {path}: {exc}")
+        notify_tui_message(f"Cannot execute xdg-open for {path}: {exc}", terminal)
 
 
-def notify_external_open(message: str) -> None:
-    sys.stdout.write("\x1b[?1049l\x1b[?25h\x1b[0m\n")
-    print(message, file=sys.stderr)
-    print("Press any key to return to Kannon.", file=sys.stderr)
+def edit_record_terminal(record: dict[str, Any], terminal: "RawTerminal | None" = None) -> None:
+    path_text = str(record.get("path_abs") or record.get("path") or "")
+    path = Path(path_text).expanduser()
+    if not path_text:
+        notify_tui_message("Cannot edit document: this record has no source path.", terminal)
+        return
+    if not path.exists():
+        notify_tui_message(f"Cannot edit document: {path} does not exist.", terminal)
+        return
+    if not is_editable_text_record(record, path):
+        kind = str(record.get("kind") or path.suffix.lower().lstrip(".") or "unknown")
+        notify_tui_message(
+            f"Cannot edit {path.name} in a terminal editor because kind '{kind}' is not a text source format. "
+            "Use x to open it externally instead.",
+            terminal,
+        )
+        return
+    command = configured_editor_command()
+    if not shutil.which(command[0]):
+        notify_tui_message(
+            f"Cannot execute configured editor '{command[0]}' because it is not on PATH. "
+            "Set VISUAL or EDITOR to an installed terminal editor, or install vim.",
+            terminal,
+        )
+        return
+
+    leave_tui_screen(terminal)
+    try:
+        result = subprocess.run([*command, str(path)], check=False)
+        if result.returncode != 0:
+            print(f"Editor exited with status {result.returncode}: {' '.join(command)}", file=sys.stderr)
+            wait_for_enter()
+    finally:
+        enter_tui_screen(terminal)
+
+
+def is_editable_text_record(record: dict[str, Any], path: Path) -> bool:
+    kind = str(record.get("kind") or "").lower()
+    if kind in EDITABLE_TEXT_KINDS:
+        return True
+    suffix = path.suffix.lower()
+    return suffix in MARKDOWN_EXTENSIONS or suffix in RTF_EXTENSIONS
+
+
+def configured_editor_command() -> list[str]:
+    for name in ("VISUAL", "EDITOR"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return shlex.split(value)
+    return ["vim"]
+
+
+def notify_tui_message(message: str, terminal: "RawTerminal | None" = None) -> None:
+    leave_tui_screen(terminal)
+    try:
+        print(message, file=sys.stderr)
+        wait_for_enter()
+    finally:
+        enter_tui_screen(terminal)
+
+
+def wait_for_enter() -> None:
+    print("Press Enter to return to Kannon.", file=sys.stderr)
     sys.stderr.flush()
-    read_key()
-    sys.stdout.write("\x1b[?1049h\x1b[?25l")
-    sys.stdout.flush()
+    try:
+        input()
+    except EOFError:
+        pass
+
+
+def leave_tui_screen(terminal: "RawTerminal | None" = None) -> None:
+    if terminal is not None:
+        terminal.restore()
+        sys.stdout.write("\x1b[?1049l\x1b[?25h\x1b[0m\n")
+        sys.stdout.flush()
+
+
+def enter_tui_screen(terminal: "RawTerminal | None" = None) -> None:
+    if terminal is not None:
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        sys.stdout.flush()
+        terminal.raw()
 
 
 class RawTerminal:
     def __enter__(self) -> "RawTerminal":
         self.fd = sys.stdin.fileno()
         self.old = termios.tcgetattr(self.fd) if sys.stdin.isatty() else None
-        if self.old is not None:
-            tty.setcbreak(self.fd)
+        self.raw()
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.restore()
+
+    def raw(self) -> None:
+        if self.old is not None:
+            tty.setcbreak(self.fd)
+
+    def restore(self) -> None:
         if self.old is not None:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
@@ -1605,7 +1763,7 @@ def grid_status_bar(
 ) -> str:
     icon = "󰆼 " if use_nerd else ""
     popup = "metadata popup open, Space/Esc closes" if show_popup else "Space metadata, arrows move"
-    text = f"{icon}[grid/{mode}] selected {selected + 1}/{total} {popup}, x opens, q quits"
+    text = f"{icon}[grid/{mode}] selected {selected + 1}/{total} {popup}, e edits, x opens, q quits"
     text = truncate_plain(text, width)
     return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"
 
@@ -1868,7 +2026,7 @@ def status_bar(start_index: int, total: int, per_page: int, mode: str, width: in
     nav_icon = "󰁔 " if use_nerd else ""
     text = (
         f"{nav_icon}[{mode}] showing {start_index + 1}-{end_index}/{total} "
-        f"per-page={per_page} arrows/j/k page, Home/End jump, x opens, q quits"
+        f"per-page={per_page} arrows/j/k page, Home/End jump, e edits, x opens, q quits"
     )
     text = truncate_plain(text, width)
     return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"

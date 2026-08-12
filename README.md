@@ -133,6 +133,18 @@ Open a 2 x 2 grid browser:
 ./kannon --grid
 ```
 
+Sort newest modified files first. This is the default:
+
+```sh
+./kannon --sort modified --descending
+```
+
+Sort by title from A to Z:
+
+```sh
+./kannon --sort title --ascending
+```
+
 Show two fitted previews per terminal page:
 
 ```sh
@@ -190,6 +202,7 @@ TTYs.
 - `Left`, `Up`, `k`, or `p`: previous document.
 - `Home`: first document.
 - `End`: last document.
+- `e`: edit the current text-source document in `$VISUAL`, `$EDITOR`, or `vim`.
 - `x`: execute `xdg-open` for the current document.
 - `q`: quit.
 
@@ -229,6 +242,7 @@ Grid controls:
 - `Home`: first document.
 - `End`: last document.
 - `Space`: open or close the selected document's metadata popup.
+- `e`: edit the selected text-source document in `$VISUAL`, `$EDITOR`, or `vim`.
 - `x`: execute `xdg-open` for the selected document.
 - `Esc`: close the popup, or quit when no popup is open.
 - `q`: quit.
@@ -237,6 +251,45 @@ Chafa is preferred in grid mode because it can render small terminal-cell
 thumbnails cleanly inside each panel. Built-in ANSI mode is also supported.
 Built-in sixel output is intentionally downgraded to ANSI inside the grid because
 portable sixel cursor placement is unreliable when four images share one screen.
+
+## Sorting
+
+Kannon sorts records before saving `kannon.yaml` and before opening the browser.
+The default is newest modified files first:
+
+```sh
+./kannon --sort modified --descending
+```
+
+Available sort keys:
+
+- `modified`
+- `created`
+- `title`
+- `path`
+- `kind`
+- `size`
+- `author`
+
+Use `--ascending` to reverse the default direction:
+
+```sh
+./kannon --sort size --ascending
+```
+
+## Opening And Editing
+
+Shortcut `x` executes `xdg-open` for the selected document and returns to Kannon
+immediately.
+
+Shortcut `e` opens editable text-source documents in the configured terminal
+editor. Kannon checks `$VISUAL`, then `$EDITOR`, then defaults to `vim`. In the
+current supported document set, Markdown and RTF are treated as text-source
+formats. PDF, DOCX, and ODT are not edited through `e`; use `x` for those.
+
+After an editor exits, Kannon redraws the current TUI view. If the file content
+changed and you want the cached thumbnail and metadata regenerated, rerun with
+`--refresh`.
 
 ## Cache Format
 
