@@ -25,6 +25,36 @@ from typing import Any, Iterable
 from xml.etree import ElementTree
 
 
+PROJECT_ROOT = Path(os.environ.get("KANNON_PROJECT_ROOT") or Path(__file__).resolve().parents[3])
+
+
+def project_root() -> Path:
+    return PROJECT_ROOT
+
+
+def install_command() -> str:
+    installer = project_root() / "install.sh"
+    if installer.exists():
+        return f"sh {shlex.quote(str(installer))}"
+    return "sh ./install.sh"
+
+
+def venv_python_command(args: str = "") -> str:
+    python = shlex.quote(str(project_root() / ".venv" / "bin" / "python"))
+    base = f"{python} -m pip"
+    return f"{base} {args}".strip()
+
+
+def startup_install_commands(package_name: str) -> list[str]:
+    venv = shlex.quote(str(project_root() / ".venv"))
+    root = shlex.quote(str(project_root()))
+    return [
+        install_command(),
+        f"python3 -m venv {venv} && {venv_python_command('install -e ' + root)}",
+        venv_python_command(f"install {package_name}"),
+    ]
+
+
 def abort_missing_startup_dependency(
     import_name: str,
     package_name: str,
@@ -38,7 +68,7 @@ def abort_missing_startup_dependency(
                 f"Missing dependency: {package_name}.",
                 f"Why it matters: Kannon needs {package_name} for {purpose}.",
                 "Consequence: no documents can be scanned or displayed until this is installed.",
-                "Try one of these commands from the repository root:",
+                "Try one of these commands:",
                 *[f"  {command}" for command in commands],
             ]
         ),
@@ -47,37 +77,42 @@ def abort_missing_startup_dependency(
     raise SystemExit(2)
 
 
+def ensure_startup_dependencies() -> None:
+    if YAML_IMPORT_ERROR is not None:
+        abort_missing_startup_dependency(
+            import_name="yaml",
+            package_name="PyYAML",
+            purpose="reading and writing kannon.yaml cache files",
+            commands=startup_install_commands("PyYAML"),
+        )
+    if PIL_IMPORT_ERROR is not None:
+        abort_missing_startup_dependency(
+            import_name="PIL",
+            package_name="Pillow",
+            purpose="creating thumbnails and rendering ANSI/sixel previews",
+            commands=startup_install_commands("Pillow"),
+        )
+
+
 try:
     import yaml
 except ModuleNotFoundError as exc:
     if exc.name != "yaml":
         raise
-    abort_missing_startup_dependency(
-        import_name="yaml",
-        package_name="PyYAML",
-        purpose="reading and writing kannon.yaml cache files",
-        commands=[
-            "python -m pip install -e .",
-            "python -m pip install -r requirements.txt",
-            "python -m pip install PyYAML",
-        ],
-    )
+    yaml = None
+    YAML_IMPORT_ERROR: ModuleNotFoundError | None = exc
+else:
+    YAML_IMPORT_ERROR = None
 
 try:
     from PIL import Image, ImageDraw, ImageFont
 except ModuleNotFoundError as exc:
     if exc.name != "PIL":
         raise
-    abort_missing_startup_dependency(
-        import_name="PIL",
-        package_name="Pillow",
-        purpose="creating thumbnails and rendering ANSI/sixel previews",
-        commands=[
-            "python -m pip install -e .",
-            "python -m pip install -r requirements.txt",
-            "python -m pip install Pillow",
-        ],
-    )
+    Image = ImageDraw = ImageFont = None  # type: ignore[assignment]
+    PIL_IMPORT_ERROR: ModuleNotFoundError | None = exc
+else:
+    PIL_IMPORT_ERROR = None
 
 
 PDF_EXTENSIONS = {".pdf"}
@@ -133,8 +168,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.per_page < 1:
         raise SystemExit("-n/--per-page must be 1 or greater")
+    if args.size < 1:
+        raise SystemExit("--size must be 1 or greater")
     if args.ascending and args.descending:
         raise SystemExit("--ascending and --descending are mutually exclusive")
+    if args.doctor:
+        return run_doctor()
+    ensure_startup_dependencies()
     paths = [Path(p).expanduser() for p in args.paths] or [Path.cwd()]
     cache_path = Path(args.cache).expanduser()
     if not cache_path.is_absolute():
@@ -266,29 +306,105 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only scan and update kannon.yaml; do not render a preview.",
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Check Kannon's Python and optional system dependencies, then exit.",
+    )
     return parser
+
+
+def run_doctor() -> int:
+    checks = [
+        ("Python", True, sys.executable, "required runtime"),
+        ("PyYAML", YAML_IMPORT_ERROR is None, "import yaml", "required for kannon.yaml cache files"),
+        ("Pillow", PIL_IMPORT_ERROR is None, "import PIL", "required for thumbnails and terminal previews"),
+        ("PyMuPDF", import_available("fitz"), "import fitz", "recommended primary PDF renderer"),
+        ("pdftoppm", shutil.which("pdftoppm") is not None, shutil.which("pdftoppm") or "not found", "optional Poppler PDF fallback"),
+        ("pdfinfo", shutil.which("pdfinfo") is not None, shutil.which("pdfinfo") or "not found", "optional Poppler PDF metadata"),
+        ("chafa", shutil.which("chafa") is not None, shutil.which("chafa") or "not found", "recommended terminal graphics renderer"),
+        ("xdg-open", shutil.which("xdg-open") is not None, shutil.which("xdg-open") or "not found", "optional x shortcut opener"),
+    ]
+    missing_required = False
+    print("Kannon doctor")
+    print(f"Project root: {project_root()}")
+    print(f"Python: {sys.executable}")
+    print()
+    for name, ok, detail, purpose in checks:
+        status = "ok" if ok else "missing"
+        print(f"{status:7} {name:10} {purpose} ({detail})")
+        if name in {"PyYAML", "Pillow"} and not ok:
+            missing_required = True
+    print()
+    if missing_required:
+        print("Required Python dependencies are missing.")
+        print(f"Install them without touching system Python: {install_command()}")
+        return 2
+    if not import_available("fitz"):
+        print("PyMuPDF is missing. PDFs can still render when pdftoppm is installed, but metadata may vary.")
+        print(f"Preferred fix: {install_command()}")
+    if not shutil.which("chafa"):
+        print("Chafa is missing. Kannon will use built-in terminal renderers.")
+        print("Install on Debian/Kali/Ubuntu: sudo apt install chafa")
+    if not shutil.which("xdg-open"):
+        print("xdg-open is missing, so the x shortcut cannot open files externally.")
+        print("Install on Debian/Kali/Ubuntu: sudo apt install xdg-utils")
+    print("Doctor finished.")
+    return 0
 
 
 def discover_documents(paths: Iterable[Path]) -> list[Path]:
     found: list[Path] = []
     seen: set[Path] = set()
     for path in paths:
-        if not path.exists():
+        if not safe_exists(path):
             print(f"warning: {path} does not exist", file=sys.stderr)
             continue
-        candidates = path.rglob("*") if path.is_dir() else [path]
-        for candidate in candidates:
-            if not candidate.is_file():
-                continue
-            if candidate.name == "kannon.yaml":
-                continue
-            if candidate.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                continue
-            resolved = candidate.resolve()
-            if resolved not in seen:
-                found.append(resolved)
-                seen.add(resolved)
+        candidates: Iterable[Path] = path.rglob("*") if safe_is_dir(path) else [path]
+        try:
+            iterator = iter(candidates)
+            for candidate in iterator:
+                if not safe_is_file(candidate):
+                    continue
+                if candidate.name == "kannon.yaml":
+                    continue
+                if candidate.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+                try:
+                    resolved = candidate.resolve()
+                except OSError as exc:
+                    print(f"warning: cannot resolve {candidate}: {exc}", file=sys.stderr)
+                    continue
+                if resolved not in seen:
+                    found.append(resolved)
+                    seen.add(resolved)
+        except OSError as exc:
+            print(f"warning: cannot scan {path}: {exc}", file=sys.stderr)
     return sorted(found, key=lambda p: str(p).lower())
+
+
+def safe_is_file(candidate: Path) -> bool:
+    try:
+        return candidate.is_file()
+    except OSError as exc:
+        print(f"warning: cannot inspect {candidate}: {exc}", file=sys.stderr)
+        return False
+
+
+def safe_is_dir(candidate: Path) -> bool:
+    try:
+        return candidate.is_dir()
+    except OSError as exc:
+        print(f"warning: cannot inspect {candidate}: {exc}", file=sys.stderr)
+        return False
+
+
+def safe_exists(candidate: Path) -> bool:
+    try:
+        return candidate.exists()
+    except OSError as exc:
+        print(f"warning: cannot inspect {candidate}: {exc}", file=sys.stderr)
+        return False
 
 
 def print_dependency_warnings(documents: list[Path]) -> None:
@@ -308,8 +424,9 @@ def print_dependency_warnings(documents: list[Path]) -> None:
                     "PDF metadata may differ from the PyMuPDF path.",
                 ],
                 actions=[
-                    "Install the primary Python PDF renderer: python -m pip install PyMuPDF",
-                    "Or install all project dependencies: python -m pip install -e .",
+                    f"Install project dependencies into the local venv: {install_command()}",
+                    f"Or install only the Python PDF renderer: {venv_python_command('install PyMuPDF')}",
+                    "Avoid system pip on Debian/Kali/Ubuntu; PEP 668 blocks it to protect OS Python.",
                     "Run Kannon with --refresh after installing to regenerate cached PDF records.",
                 ],
                 details=f"Python import 'fitz' was not found. Using pdftoppm at {pdftoppm_path}.",
@@ -390,9 +507,17 @@ def format_dependency_notice(
 def load_cache(cache_path: Path) -> dict[str, Any]:
     if not cache_path.exists():
         return {}
-    with cache_path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+    try:
+        with cache_path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+    except OSError as exc:
+        print(f"warning: cannot read cache {cache_path}: {exc}; rebuilding cache.", file=sys.stderr)
+        return {}
+    except yaml.YAMLError as exc:
+        print(f"warning: cannot parse cache {cache_path}: {exc}; rebuilding cache.", file=sys.stderr)
+        return {}
     if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
+        print(f"warning: ignoring unsupported cache format in {cache_path}; rebuilding cache.", file=sys.stderr)
         return {}
     return data
 
@@ -404,8 +529,23 @@ def save_cache(cache_path: Path, records: list[dict[str, Any]], thumbnail_size: 
         "thumbnail_size": thumbnail_size,
         "documents": records,
     }
-    with cache_path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(payload, handle, sort_keys=False, allow_unicode=False, width=100)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(payload, handle, sort_keys=False, allow_unicode=False, width=100)
+    except OSError as exc:
+        raise SystemExit(
+            "\n".join(
+                [
+                    f"Kannon could not write the cache file: {cache_path}",
+                    f"Reason: {exc}",
+                    "Consequence: thumbnails and metadata cannot be saved for reuse.",
+                    "Actions:",
+                    "  - Choose a writable cache path with --cache /path/to/kannon.yaml",
+                    "  - Check directory permissions and available disk space.",
+                ]
+            )
+        ) from exc
 
 
 def build_records(
@@ -421,7 +561,11 @@ def build_records(
     }
     records: list[dict[str, Any]] = []
     for document in documents:
-        stat = document.stat()
+        try:
+            stat = document.stat()
+        except OSError as exc:
+            print(f"warning: cannot stat {document}: {exc}; skipping.", file=sys.stderr)
+            continue
         old = old_records.get(str(document))
         if old and not refresh and record_is_current(old, stat, thumbnail_size):
             records.append(old)
@@ -447,12 +591,20 @@ def build_records(
 def sort_records(records: list[dict[str, Any]], key_name: str, descending: bool) -> list[dict[str, Any]]:
     if key_name not in SORT_KEYS:
         raise SystemExit(f"unsupported sort key: {key_name}")
-    return sorted(records, key=lambda record: sort_value(record, key_name), reverse=descending)
+    present = [record for record in records if sort_value(record, key_name)[0] == 1]
+    missing = [record for record in records if sort_value(record, key_name)[0] == 0]
+    present.sort(key=lambda record: sort_value(record, key_name)[1], reverse=descending)
+    missing.sort(key=lambda record: str(record.get("path") or record.get("path_abs") or "").casefold())
+    return present + missing
 
 
 def sort_value(record: dict[str, Any], key_name: str) -> tuple[int, str | int]:
     source = record.get("source", {})
     metadata = record.get("metadata", {})
+    if not isinstance(source, dict):
+        source = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
     if key_name == "modified":
         return sortable_datetime(source.get("modified"))
     if key_name == "created":
@@ -495,10 +647,13 @@ def sortable_number(value: Any) -> tuple[int, int]:
 
 def record_is_current(record: dict[str, Any], stat: os.stat_result, thumbnail_size: int) -> bool:
     source = record.get("source", {})
+    thumbnail = record.get("thumbnail", {})
+    if not isinstance(source, dict) or not isinstance(thumbnail, dict):
+        return False
     return (
         source.get("mtime_ns") == stat.st_mtime_ns
         and source.get("size_bytes") == stat.st_size
-        and record.get("thumbnail", {}).get("max_edge") == thumbnail_size
+        and thumbnail.get("max_edge") == thumbnail_size
     )
 
 
@@ -583,7 +738,7 @@ def error_metadata(exc: Exception) -> dict[str, Any]:
         "consequences": ["This document was indexed without a generated thumbnail."],
         "actions": [
             "Run the command again with --refresh after fixing the input file or environment.",
-            "If this is a dependency problem, install dependencies with: python -m pip install -e .",
+            f"If this is a dependency problem, install into the local venv with: {install_command()}",
         ],
     }
 
@@ -613,7 +768,7 @@ def format_unexpected_error(document: Path, exc: Exception) -> str:
             "    - This document was indexed without a generated thumbnail.",
             "  actions:",
             "    - Run again with --refresh after fixing the document or environment.",
-            "    - If this looks like a dependency issue, run: python -m pip install -e .",
+            f"    - If this looks like a dependency issue, run: {install_command()}",
         ]
     )
 
@@ -714,8 +869,9 @@ def missing_pdf_renderer_error(pymupdf_missing: bool) -> KannonError:
             "Markdown documents are unaffected.",
         ],
         actions=[
-            "From this repository, install Python dependencies: python -m pip install -e .",
-            "Or install only the Python PDF renderer: python -m pip install PyMuPDF",
+            f"From this repository, install Python dependencies into a local venv: {install_command()}",
+            f"Or install only the Python PDF renderer: {venv_python_command('install PyMuPDF')}",
+            "Do not use system pip on Debian/Kali/Ubuntu unless you intentionally override PEP 668.",
             "Or install Poppler on Debian/Ubuntu: sudo apt install poppler-utils",
             "Or install Poppler on Fedora: sudo dnf install poppler-utils",
             "Or install Poppler on macOS with Homebrew: brew install poppler",
@@ -1912,9 +2068,12 @@ def record_image(record: dict[str, Any]) -> Image.Image | None:
     if not isinstance(thumbnail, dict):
         return None
     data = thumbnail.get("data")
-    if not data:
+    if not isinstance(data, str) or not data:
         return None
-    return Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
+    try:
+        return Image.open(io.BytesIO(base64.b64decode(data, validate=True))).convert("RGB")
+    except (OSError, ValueError, base64.binascii.Error):
+        return None
 
 
 def metadata_lines(
@@ -1935,11 +2094,15 @@ def metadata_lines(
     if record.get("user_name"):
         add_field(lines, ui_label("User", "󰀄", use_nerd), record.get("user_name"), width)
     source = record.get("source", {})
+    if not isinstance(source, dict):
+        source = {}
     add_field(lines, ui_label("Created", "󰃭", use_nerd), source.get("created"), width)
     add_field(lines, ui_label("Modified", "󰚰", use_nerd), source.get("modified"), width)
     add_field(lines, ui_label("Size", "󰋊", use_nerd), human_size(source.get("size_bytes")), width)
 
     metadata = record.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
     preferred = [
         "author",
         "Author",

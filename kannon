@@ -2,7 +2,14 @@
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export KANNON_PROJECT_ROOT="$ROOT_DIR"
+if [ -x "${ROOT_DIR}/.venv/bin/python" ]; then
+    PYTHON="${ROOT_DIR}/.venv/bin/python"
+else
+    PYTHON="${PYTHON:-python3}"
+fi
+
 PYTHONPATH="${ROOT_DIR}/src/python${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONPATH
 
-exec python3 -m kannon "$@"
+exec "$PYTHON" -m kannon "$@"

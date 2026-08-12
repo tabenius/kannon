@@ -27,6 +27,7 @@ It currently supports:
 ```text
 .
 ├── kannon                  # executable repo-root wrapper
+├── install.sh              # local venv installer
 ├── pyproject.toml          # Python project metadata and dependencies
 ├── README.md
 └── src/python/kannon/      # application package
@@ -38,7 +39,8 @@ The wrapper keeps the source tree local-friendly:
 ./kannon --help
 ```
 
-It sets `PYTHONPATH=src/python` and runs `python3 -m kannon`.
+It sets `PYTHONPATH=src/python` and runs Kannon with `.venv/bin/python` when a
+local virtual environment exists. Otherwise it falls back to `python3`.
 
 ## Dependencies
 
@@ -50,7 +52,8 @@ Runtime dependencies are listed in `pyproject.toml`:
 - `PyYAML>=6.0` for reading and writing `kannon.yaml`.
 
 The same Python dependencies are repeated in `requirements.txt` for users who
-prefer direct `pip install -r requirements.txt` workflows.
+prefer direct virtual-environment workflows. Do not install them with system
+`pip` on Debian, Kali, Ubuntu, or other PEP 668 managed Python installations.
 
 PDF renderer dependencies are only required when the scan input includes PDFs.
 Markdown, RTF, DOCX, and ODT scans do not require PyMuPDF, `pdftoppm`, or
@@ -78,119 +81,148 @@ System expectations:
 From the repository root:
 
 ```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e .
+sh ./install.sh
 ```
 
-You can then run either:
+The installer creates `.venv`, installs Kannon into that local virtual
+environment, and links `kannon` into `~/.local/bin/kannon`.
+
+Check the installation at any time:
+
+```sh
+kannon --doctor
+```
+
+You can then run:
 
 ```sh
 kannon
 ```
 
-or:
+If `~/.local/bin` is not on your `PATH`, either add it:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+or run the repository wrapper directly:
 
 ```sh
 ./kannon
 ```
+
+Manual virtual-environment install, useful for development:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+```
+
+The common failure mode on Kali/Debian/Ubuntu is:
+
+```text
+error: externally-managed-environment
+```
+
+That means you tried to use system `pip`. Use `sh ./install.sh` or
+`.venv/bin/python -m pip ...` instead.
 
 ## Basic Usage
 
 Scan the current directory recursively and open the TUI:
 
 ```sh
-./kannon
+kannon
 ```
 
 Scan explicit files or directories:
 
 ```sh
-./kannon reports/ contract.pdf notes.md draft.docx outline.odt
+kannon reports/ contract.pdf notes.md draft.docx outline.odt
 ```
 
 Regenerate all cached thumbnails and metadata:
 
 ```sh
-./kannon --refresh
+kannon --refresh
 ```
 
 Write or update `kannon.yaml` without opening a preview:
 
 ```sh
-./kannon --scan-only
+kannon --scan-only
 ```
 
 Render only the first record once:
 
 ```sh
-./kannon --no-tui
+kannon --no-tui
 ```
 
 Open a 2 x 2 grid browser:
 
 ```sh
-./kannon --grid
+kannon --grid
 ```
 
 Sort newest modified files first. This is the default:
 
 ```sh
-./kannon --sort modified --descending
+kannon --sort modified --descending
 ```
 
 Sort by title from A to Z:
 
 ```sh
-./kannon --sort title --ascending
+kannon --sort title --ascending
 ```
 
 Show two fitted previews per terminal page:
 
 ```sh
-./kannon -n 2
+kannon -n 2
 ```
 
 Force ANSI fallback output:
 
 ```sh
-./kannon --ansi
+kannon --ansi
 ```
 
 Force Chafa output:
 
 ```sh
-./kannon --chafa
+kannon --chafa
 ```
 
 Disable automatic Chafa output:
 
 ```sh
-./kannon --no-chafa
+kannon --no-chafa
 ```
 
 Force sixel output:
 
 ```sh
-./kannon --sixel
+kannon --sixel
 ```
 
 Disable Nerd Font UI glyphs:
 
 ```sh
-./kannon --no-nerd
+kannon --no-nerd
 ```
 
 Use a different thumbnail max edge:
 
 ```sh
-./kannon --size 768
+kannon --size 768
 ```
 
 Use a different cache file:
 
 ```sh
-./kannon --cache .kannon-documents.yaml
+kannon --cache .kannon-documents.yaml
 ```
 
 ## TUI Controls
@@ -226,7 +258,7 @@ right-side terminal columns.
 Use `--grid` to browse four documents at a time in a 2 x 2 terminal layout:
 
 ```sh
-./kannon --grid
+kannon --grid
 ```
 
 Each grid cell shows only the filename and last modified date in its surrounding
@@ -258,7 +290,7 @@ Kannon sorts records before saving `kannon.yaml` and before opening the browser.
 The default is newest modified files first:
 
 ```sh
-./kannon --sort modified --descending
+kannon --sort modified --descending
 ```
 
 Available sort keys:
@@ -274,7 +306,7 @@ Available sort keys:
 Use `--ascending` to reverse the default direction:
 
 ```sh
-./kannon --sort size --ascending
+kannon --sort size --ascending
 ```
 
 ## Opening And Editing
@@ -408,13 +440,24 @@ To install the primary Python PDF renderer and the rest of the Python
 dependencies:
 
 ```sh
-python -m pip install -e .
+sh ./install.sh
 ```
 
 To install only PyMuPDF:
 
 ```sh
-python -m pip install PyMuPDF
+.venv/bin/python -m pip install PyMuPDF
+```
+
+If `python -m pip install ...` reports `externally-managed-environment`, that is
+your operating system protecting system Python. Do not use
+`--break-system-packages` for Kannon. Use the local venv created by
+`sh ./install.sh`.
+
+To inspect the current environment and optional render/open helpers:
+
+```sh
+kannon --doctor
 ```
 
 On Debian or Ubuntu systems the Poppler fallback package is typically:
@@ -438,13 +481,13 @@ brew install poppler
 If sixel output corrupts the screen:
 
 ```sh
-./kannon --ansi
+kannon --ansi
 ```
 
 If Chafa output is not appropriate for your terminal:
 
 ```sh
-./kannon --no-chafa
+kannon --no-chafa
 ```
 
 If `--chafa` fails because Chafa is missing, install it with your package manager:
@@ -456,7 +499,7 @@ sudo apt install chafa
 If the cache appears stale:
 
 ```sh
-./kannon --refresh
+kannon --refresh
 ```
 
 If no files are found, check that the input paths contain files ending in
@@ -467,13 +510,13 @@ If no files are found, check that the input paths contain files ending in
 Run a syntax check:
 
 ```sh
-python3 -m py_compile src/python/kannon/*.py
+python3 -c 'import ast, pathlib; [ast.parse(p.read_text(), filename=str(p)) for p in pathlib.Path("src/python/kannon").glob("*.py")]'
 ```
 
 Build or install from the project metadata:
 
 ```sh
-python -m pip install -e .
+sh ./install.sh
 ```
 
 The implementation avoids a terminal UI framework so the image renderers can
