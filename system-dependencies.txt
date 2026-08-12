@@ -1,0 +1,5 @@
+python3>=3.10
+
+# Optional but recommended fallback tools for PDF rendering/metadata when
+# PyMuPDF is not installed in the active Python environment.
+poppler-utils
