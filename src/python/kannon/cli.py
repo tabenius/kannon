@@ -157,6 +157,12 @@ def main(argv: list[str] | None = None) -> int:
 
     mode = choose_render_mode(args)
     use_nerd = not args.no_nerd
+    if args.grid:
+        if args.no_tui or not (sys.stdin.isatty() and sys.stdout.isatty()):
+            render_grid(records, mode, selected=0, use_nerd=use_nerd, show_popup=False)
+            return 0
+        run_grid_tui(records, mode, use_nerd)
+        return 0
     if args.no_tui or not (sys.stdin.isatty() and sys.stdout.isatty()):
         render_page(records, mode, start_index=0, per_page=args.per_page, use_nerd=use_nerd)
         return 0
@@ -215,6 +221,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-tui",
         action="store_true",
         help="Render the first record once and exit instead of opening the arrow-key TUI.",
+    )
+    parser.add_argument(
+        "--grid",
+        action="store_true",
+        help="Use a 2x2 thumbnail grid. Arrow keys move selection; Space opens metadata.",
     )
     parser.add_argument(
         "-n",
@@ -1348,6 +1359,9 @@ def run_tui(records: list[dict[str, Any]], mode: RenderMode, per_page: int, use_
                 key = read_key()
                 if key in {"q", "Q", "\x03", "\x04"}:
                     break
+                if key in {"x", "X"}:
+                    open_record_external(records[index])
+                    continue
                 if key in {"right", "down", "j", "n", " "}:
                     index = min(index + per_page, max(0, len(records) - 1))
                 elif key in {"left", "up", "k", "p"}:
@@ -1359,6 +1373,84 @@ def run_tui(records: list[dict[str, Any]], mode: RenderMode, per_page: int, use_
         finally:
             sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
             sys.stdout.flush()
+
+
+def run_grid_tui(records: list[dict[str, Any]], mode: RenderMode, use_nerd: bool) -> None:
+    selected = 0
+    show_popup = False
+    with RawTerminal():
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        sys.stdout.flush()
+        try:
+            while True:
+                render_grid(records, mode, selected=selected, use_nerd=use_nerd, show_popup=show_popup)
+                key = read_key()
+                if key in {"q", "Q", "\x03", "\x04", "esc"}:
+                    if show_popup and key == "esc":
+                        show_popup = False
+                        continue
+                    break
+                if key == " ":
+                    show_popup = not show_popup
+                    continue
+                if key in {"x", "X"}:
+                    open_record_external(records[selected])
+                    continue
+                if show_popup:
+                    continue
+                if key in {"right", "l", "n"}:
+                    selected = min(selected + 1, len(records) - 1)
+                elif key in {"left", "h", "p"}:
+                    selected = max(selected - 1, 0)
+                elif key in {"down", "j"}:
+                    selected = min(selected + 2, len(records) - 1)
+                elif key in {"up", "k"}:
+                    selected = max(selected - 2, 0)
+                elif key == "home":
+                    selected = 0
+                elif key == "end":
+                    selected = len(records) - 1
+        finally:
+            sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+
+
+def open_record_external(record: dict[str, Any]) -> None:
+    path_text = str(record.get("path_abs") or record.get("path") or "")
+    path = Path(path_text).expanduser()
+    if not path_text:
+        notify_external_open("Cannot open document: this record has no source path.")
+        return
+    if not path.exists():
+        notify_external_open(f"Cannot open document: {path} does not exist.")
+        return
+    opener = shutil.which("xdg-open")
+    if not opener:
+        notify_external_open(
+            "Cannot execute xdg-open because it is not installed or not on PATH. "
+            "Install xdg-utils, or open the file manually: " + str(path)
+        )
+        return
+    try:
+        subprocess.Popen(
+            [opener, str(path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        notify_external_open(f"Cannot execute xdg-open for {path}: {exc}")
+
+
+def notify_external_open(message: str) -> None:
+    sys.stdout.write("\x1b[?1049l\x1b[?25h\x1b[0m\n")
+    print(message, file=sys.stderr)
+    print("Press any key to return to Kannon.", file=sys.stderr)
+    sys.stderr.flush()
+    read_key()
+    sys.stdout.write("\x1b[?1049h\x1b[?25l")
+    sys.stdout.flush()
 
 
 class RawTerminal:
@@ -1410,6 +1502,136 @@ def render_page(
         render_sixel_screen(records, visible, terminal, start_index, per_page, use_nerd)
     else:
         render_ansi_screen(records, visible, terminal, start_index, per_page, use_nerd)
+
+
+def render_grid(
+    records: list[dict[str, Any]],
+    mode: RenderMode,
+    selected: int,
+    use_nerd: bool,
+    show_popup: bool,
+) -> None:
+    terminal = shutil.get_terminal_size((100, 30))
+    sys.stdout.write("\x1b[2J\x1b[H")
+    cell_width = max(20, terminal.columns // 2)
+    cell_height = max(6, (terminal.lines - 1) // 2)
+    page_start = (selected // 4) * 4
+    visible = records[page_start : page_start + 4]
+    for offset, record in enumerate(visible):
+        row = offset // 2
+        col = offset % 2
+        top = row * cell_height + 1
+        left = col * cell_width + 1
+        width = cell_width if col == 0 else terminal.columns - cell_width
+        height = cell_height
+        draw_grid_cell(
+            record=record,
+            mode=mode,
+            top=top,
+            left=left,
+            width=width,
+            height=height,
+            selected=(page_start + offset) == selected,
+            use_nerd=use_nerd,
+        )
+    if show_popup and records:
+        draw_metadata_popup(records[selected], terminal, selected, len(records), use_nerd)
+    sys.stdout.write(
+        f"\x1b[{terminal.lines};1H"
+        f"{grid_status_bar(selected, len(records), mode.name, terminal.columns, show_popup, use_nerd)}"
+    )
+    sys.stdout.flush()
+
+
+def draw_grid_cell(
+    record: dict[str, Any],
+    mode: RenderMode,
+    top: int,
+    left: int,
+    width: int,
+    height: int,
+    selected: bool,
+    use_nerd: bool,
+) -> None:
+    border_color = "\x1b[38;2;244;114;182m" if selected else "\x1b[38;2;71;85;105m"
+    label_bg = "\x1b[48;2;131;24;67m" if selected else "\x1b[48;2;30;41;59m"
+    draw_box(top, left, width, height, border_color)
+    label = grid_cell_label(record, width - 2, use_nerd)
+    sys.stdout.write(f"\x1b[{top};{left + 1}H{label_bg}\x1b[38;2;248;250;252m{label}\x1b[0m")
+    image = record_image(record)
+    image_width = max(4, width - 2)
+    image_height = max(1, height - 3)
+    body_top = top + 1
+    body_left = left + 1
+    if not image:
+        sys.stdout.write(f"\x1b[{body_top};{body_left}H(no thumbnail)")
+        return
+    if mode.name == "chafa":
+        output = image_to_chafa(image, image_width, image_height)
+        lines = output.splitlines()
+    else:
+        lines = image_to_ansi_lines(image, image_width, image_height)
+    for row, line in enumerate(lines[:image_height], start=body_top):
+        sys.stdout.write(f"\x1b[{row};{body_left}H{line}\x1b[0m")
+
+
+def draw_box(top: int, left: int, width: int, height: int, color: str) -> None:
+    width = max(2, width)
+    height = max(2, height)
+    horizontal = "─" * max(0, width - 2)
+    sys.stdout.write(f"\x1b[{top};{left}H{color}┌{horizontal}┐\x1b[0m")
+    for row in range(top + 1, top + height - 1):
+        sys.stdout.write(f"\x1b[{row};{left}H{color}│\x1b[0m")
+        sys.stdout.write(f"\x1b[{row};{left + width - 1}H{color}│\x1b[0m")
+    sys.stdout.write(f"\x1b[{top + height - 1};{left}H{color}└{horizontal}┘\x1b[0m")
+
+
+def grid_cell_label(record: dict[str, Any], width: int, use_nerd: bool) -> str:
+    source = record.get("source", {})
+    icon = "󰈙 " if use_nerd else ""
+    name = Path(str(record.get("path") or record.get("path_abs") or record.get("title") or "")).name
+    text = f"{icon}{name}  {short_date(source.get('modified'))}"
+    text = truncate_plain(text, width)
+    return text + " " * max(0, width - len(text))
+
+
+def grid_status_bar(
+    selected: int,
+    total: int,
+    mode: str,
+    width: int,
+    show_popup: bool,
+    use_nerd: bool,
+) -> str:
+    icon = "󰆼 " if use_nerd else ""
+    popup = "metadata popup open, Space/Esc closes" if show_popup else "Space metadata, arrows move"
+    text = f"{icon}[grid/{mode}] selected {selected + 1}/{total} {popup}, x opens, q quits"
+    text = truncate_plain(text, width)
+    return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"
+
+
+def draw_metadata_popup(
+    record: dict[str, Any],
+    terminal: os.terminal_size,
+    index: int,
+    total: int,
+    use_nerd: bool,
+) -> None:
+    width = min(max(44, terminal.columns - 12), 88)
+    height = min(max(10, terminal.lines - 6), 22)
+    top = max(2, (terminal.lines - height) // 2)
+    left = max(2, (terminal.columns - width) // 2)
+    sys.stdout.write(f"\x1b[{top};{left}H\x1b[48;2;15;23;42m{' ' * width}\x1b[0m")
+    draw_box(top, left, width, height, "\x1b[38;2;56;189;248m")
+    title = f" Metadata {index + 1}/{total} "
+    sys.stdout.write(f"\x1b[{top};{left + 2}H\x1b[48;2;15;23;42m\x1b[38;2;186;230;253m{title}\x1b[0m")
+    lines = metadata_lines(record, index, total, width - 4, use_nerd)
+    for offset, line in enumerate(lines[: height - 3], start=top + 2):
+        clean = truncate_plain(line, width - 4)
+        sys.stdout.write(
+            f"\x1b[{offset};{left + 2}H"
+            f"\x1b[48;2;15;23;42m\x1b[38;2;226;232;240m{clean}{' ' * max(0, width - 4 - len(clean))}\x1b[0m"
+        )
 
 
 def render_chafa_screen(
@@ -1646,7 +1868,7 @@ def status_bar(start_index: int, total: int, per_page: int, mode: str, width: in
     nav_icon = "󰁔 " if use_nerd else ""
     text = (
         f"{nav_icon}[{mode}] showing {start_index + 1}-{end_index}/{total} "
-        f"per-page={per_page} arrows/j/k page, Home/End jump, q quits"
+        f"per-page={per_page} arrows/j/k page, Home/End jump, x opens, q quits"
     )
     text = truncate_plain(text, width)
     return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"

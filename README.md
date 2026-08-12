@@ -20,6 +20,7 @@ It currently supports:
   and the terminal appears to support sixel.
 - Built-in ANSI true-color block output as a fallback or explicit mode.
 - Arrow-key navigation by default.
+- Optional 2 x 2 grid browser with a selected-document frame and metadata popup.
 
 ## Repository Layout
 
@@ -126,6 +127,12 @@ Render only the first record once:
 ./kannon --no-tui
 ```
 
+Open a 2 x 2 grid browser:
+
+```sh
+./kannon --grid
+```
+
 Show two fitted previews per terminal page:
 
 ```sh
@@ -183,6 +190,7 @@ TTYs.
 - `Left`, `Up`, `k`, or `p`: previous document.
 - `Home`: first document.
 - `End`: last document.
+- `x`: execute `xdg-open` for the current document.
 - `q`: quit.
 
 The preview is drawn at roughly 75% of terminal width, with metadata shown to the
@@ -199,6 +207,36 @@ colored symbols mode for reliable side-by-side layout inside the TUI. Built-in
 ANSI mode uses terminal character cells directly. Built-in sixel mode scales the
 image in pixels using an 8-pixel cell-width estimate, then places metadata in the
 right-side terminal columns.
+
+### Grid Mode
+
+Use `--grid` to browse four documents at a time in a 2 x 2 terminal layout:
+
+```sh
+./kannon --grid
+```
+
+Each grid cell shows only the filename and last modified date in its surrounding
+bar so the thumbnails get most of the available space. The selected document has
+a colored frame.
+
+Grid controls:
+
+- `Right`, `l`, or `n`: move to the next document.
+- `Left`, `h`, or `p`: move to the previous document.
+- `Down` or `j`: move down one grid row.
+- `Up` or `k`: move up one grid row.
+- `Home`: first document.
+- `End`: last document.
+- `Space`: open or close the selected document's metadata popup.
+- `x`: execute `xdg-open` for the selected document.
+- `Esc`: close the popup, or quit when no popup is open.
+- `q`: quit.
+
+Chafa is preferred in grid mode because it can render small terminal-cell
+thumbnails cleanly inside each panel. Built-in ANSI mode is also supported.
+Built-in sixel output is intentionally downgraded to ANSI inside the grid because
+portable sixel cursor placement is unreliable when four images share one screen.
 
 ## Cache Format
 
