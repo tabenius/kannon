@@ -39,6 +39,13 @@ def install_command() -> str:
     return "sh ./install.sh"
 
 
+def install_command_parts() -> list[str]:
+    installer = project_root() / "install.sh"
+    if installer.exists():
+        return ["sh", str(installer)]
+    return ["sh", "./install.sh"]
+
+
 def venv_python_command(args: str = "") -> str:
     python = shlex.quote(str(project_root() / ".venv" / "bin" / "python"))
     base = f"{python} -m pip"
@@ -137,6 +144,25 @@ SORT_KEYS = ("modified", "created", "title", "path", "kind", "size", "author")
 class RenderMode:
     name: str
     forced: bool = False
+
+
+@dataclass(frozen=True)
+class DoctorFix:
+    label: str
+    command: list[str]
+
+    def command_text(self) -> str:
+        return " ".join(shlex.quote(part) for part in self.command)
+
+
+@dataclass(frozen=True)
+class DoctorCheck:
+    name: str
+    ok: bool
+    detail: str
+    purpose: str
+    required: bool = False
+    fix: DoctorFix | None = None
 
 
 class KannonError(Exception):
@@ -315,42 +341,161 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_doctor() -> int:
-    checks = [
-        ("Python", True, sys.executable, "required runtime"),
-        ("PyYAML", YAML_IMPORT_ERROR is None, "import yaml", "required for kannon.yaml cache files"),
-        ("Pillow", PIL_IMPORT_ERROR is None, "import PIL", "required for thumbnails and terminal previews"),
-        ("PyMuPDF", import_available("fitz"), "import fitz", "recommended primary PDF renderer"),
-        ("pdftoppm", shutil.which("pdftoppm") is not None, shutil.which("pdftoppm") or "not found", "optional Poppler PDF fallback"),
-        ("pdfinfo", shutil.which("pdfinfo") is not None, shutil.which("pdfinfo") or "not found", "optional Poppler PDF metadata"),
-        ("chafa", shutil.which("chafa") is not None, shutil.which("chafa") or "not found", "recommended terminal graphics renderer"),
-        ("xdg-open", shutil.which("xdg-open") is not None, shutil.which("xdg-open") or "not found", "optional x shortcut opener"),
-    ]
-    missing_required = False
+    checks = doctor_checks()
     print("Kannon doctor")
     print(f"Project root: {project_root()}")
     print(f"Python: {sys.executable}")
     print()
-    for name, ok, detail, purpose in checks:
-        status = "ok" if ok else "missing"
-        print(f"{status:7} {name:10} {purpose} ({detail})")
-        if name in {"PyYAML", "Pillow"} and not ok:
-            missing_required = True
+    for check in checks:
+        status = "ok" if check.ok else "missing"
+        print(f"{status:7} {check.name:10} {check.purpose} ({check.detail})")
     print()
-    if missing_required:
-        print("Required Python dependencies are missing.")
-        print(f"Install them without touching system Python: {install_command()}")
-        return 2
-    if not import_available("fitz"):
+
+    missing_required = any(check.required and not check.ok for check in checks)
+    fixable = [check for check in checks if not check.ok and check.fix is not None]
+    if fixable:
+        ran_repairs = run_doctor_repairs(fixable)
+        if ran_repairs:
+            print("Repair commands finished. Rerun kannon --doctor so the wrapper can use any new .venv.")
+            print()
+    else:
+        print("No automatic repair commands are available.")
+
+    if any(check.name == "PyMuPDF" and not check.ok for check in checks):
         print("PyMuPDF is missing. PDFs can still render when pdftoppm is installed, but metadata may vary.")
         print(f"Preferred fix: {install_command()}")
-    if not shutil.which("chafa"):
+    if any(check.name == "chafa" and not check.ok for check in checks):
         print("Chafa is missing. Kannon will use built-in terminal renderers.")
         print("Install on Debian/Kali/Ubuntu: sudo apt install chafa")
-    if not shutil.which("xdg-open"):
+    if any(check.name == "xdg-open" and not check.ok for check in checks):
         print("xdg-open is missing, so the x shortcut cannot open files externally.")
         print("Install on Debian/Kali/Ubuntu: sudo apt install xdg-utils")
     print("Doctor finished.")
-    return 0
+    return 2 if missing_required else 0
+
+
+def doctor_checks() -> list[DoctorCheck]:
+    python_dependencies_ok = YAML_IMPORT_ERROR is None and PIL_IMPORT_ERROR is None and import_available("fitz")
+    python_fix = None if python_dependencies_ok else DoctorFix("Install Kannon Python dependencies into .venv", install_command_parts())
+    return [
+        DoctorCheck("Python", True, sys.executable, "required runtime", required=True),
+        DoctorCheck(
+            "PyYAML",
+            YAML_IMPORT_ERROR is None,
+            "import yaml",
+            "required for kannon.yaml cache files",
+            required=True,
+            fix=python_fix,
+        ),
+        DoctorCheck(
+            "Pillow",
+            PIL_IMPORT_ERROR is None,
+            "import PIL",
+            "required for thumbnails and terminal previews",
+            required=True,
+            fix=python_fix,
+        ),
+        DoctorCheck(
+            "PyMuPDF",
+            import_available("fitz"),
+            "import fitz",
+            "recommended primary PDF renderer",
+            fix=python_fix,
+        ),
+        DoctorCheck(
+            "pdftoppm",
+            shutil.which("pdftoppm") is not None,
+            shutil.which("pdftoppm") or "not found",
+            "optional Poppler PDF fallback",
+            fix=system_package_fix("poppler-utils", "poppler"),
+        ),
+        DoctorCheck(
+            "pdfinfo",
+            shutil.which("pdfinfo") is not None,
+            shutil.which("pdfinfo") or "not found",
+            "optional Poppler PDF metadata",
+            fix=system_package_fix("poppler-utils", "poppler"),
+        ),
+        DoctorCheck(
+            "chafa",
+            shutil.which("chafa") is not None,
+            shutil.which("chafa") or "not found",
+            "recommended terminal graphics renderer",
+            fix=system_package_fix("chafa", "chafa"),
+        ),
+        DoctorCheck(
+            "xdg-open",
+            shutil.which("xdg-open") is not None,
+            shutil.which("xdg-open") or "not found",
+            "optional x shortcut opener",
+            fix=system_package_fix("xdg-utils", None),
+        ),
+    ]
+
+
+def system_package_fix(debian_package: str, brew_package: str | None) -> DoctorFix | None:
+    if shutil.which("apt"):
+        return DoctorFix(f"Install {debian_package} with apt", ["sudo", "apt", "install", debian_package])
+    if shutil.which("dnf"):
+        return DoctorFix(f"Install {debian_package} with dnf", ["sudo", "dnf", "install", debian_package])
+    if brew_package and shutil.which("brew"):
+        return DoctorFix(f"Install {brew_package} with Homebrew", ["brew", "install", brew_package])
+    return None
+
+
+def run_doctor_repairs(checks: list[DoctorCheck]) -> bool:
+    repairs: list[DoctorFix] = []
+    seen: set[tuple[str, ...]] = set()
+    for check in checks:
+        if check.fix is None:
+            continue
+        key = tuple(check.fix.command)
+        if key not in seen:
+            repairs.append(check.fix)
+            seen.add(key)
+    if not repairs:
+        return False
+    print("Available repair command(s):")
+    for fix in repairs:
+        print(f"  - {fix.label}: {fix.command_text()}")
+    print()
+    if not sys.stdin.isatty():
+        print("Not prompting because stdin is not interactive. Run kannon --doctor in a terminal to apply repairs.")
+        return False
+    ran_any = False
+    for fix in repairs:
+        if confirm(f"Run {fix.label}? [{fix.command_text()}]"):
+            run_repair_command(fix)
+            ran_any = True
+        else:
+            print(f"Skipped: {fix.label}")
+    print()
+    return ran_any
+
+
+def confirm(prompt: str) -> bool:
+    while True:
+        try:
+            answer = input(f"{prompt} [y/N] ").strip().lower()
+        except EOFError:
+            return False
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"", "n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+
+def run_repair_command(fix: DoctorFix) -> None:
+    print(f"Running: {fix.command_text()}")
+    try:
+        subprocess.run(fix.command, check=True)
+    except FileNotFoundError as exc:
+        print(f"error: command not found: {exc.filename}", file=sys.stderr)
+    except subprocess.CalledProcessError as exc:
+        print(f"error: repair command failed with exit status {exc.returncode}: {fix.command_text()}", file=sys.stderr)
+    else:
+        print(f"Completed: {fix.label}")
 
 
 def discover_documents(paths: Iterable[Path]) -> list[Path]:

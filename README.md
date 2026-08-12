@@ -93,6 +93,10 @@ Check the installation at any time:
 kannon --doctor
 ```
 
+When something fixable is missing, `--doctor` shows the repair command and asks
+`y/N` before running it. In non-interactive scripts it only prints diagnostics
+and suggested commands.
+
 You can then run:
 
 ```sh
@@ -454,7 +458,8 @@ your operating system protecting system Python. Do not use
 `--break-system-packages` for Kannon. Use the local venv created by
 `sh ./install.sh`.
 
-To inspect the current environment and optional render/open helpers:
+To inspect the current environment and optional render/open helpers, and to run
+available repair commands after a `y/N` prompt:
 
 ```sh
 kannon --doctor
