@@ -179,6 +179,12 @@ Open a 2 x 2 grid browser:
 kannon --grid
 ```
 
+Disable live refresh while browsing:
+
+```sh
+kannon --watch off
+```
+
 Sort newest modified files first. This is the default:
 
 ```sh
@@ -264,11 +270,17 @@ TTYs.
 - `M`, `Shift-Tab`: switch to the previous render mode.
 - `/`: search title, path, metadata, and cached text preview.
 - `?`: show key help.
-- `r`: refresh the current record in memory.
+- `r`: refresh the current record and write the updated cache.
 - `Enter`: execute `xdg-open` for the current document.
 - `e`: edit the current text-source document in `$VISUAL`, `$EDITOR`, or `vim`.
 - `x`: execute `xdg-open` for the current document.
 - `q`: quit.
+
+While the TUI is open, Kannon watches the indexed files for changes and
+auto-refreshes changed records in the cache. On Linux it uses native inotify
+plus periodic polling by default. On other platforms, or when inotify is not
+available, it uses polling. Use `--watch off` to disable this, `--watch poll` to
+force polling, or `--watch-interval 2.5` to make polling less frequent.
 
 The preview is drawn at roughly 75% of terminal width, with metadata shown to the
 right. By default Kannon fits one thumbnail per terminal page. Use `-n 2`,
@@ -312,7 +324,7 @@ Grid controls:
 - `M`, `Shift-Tab`: switch to the previous render mode.
 - `/`: search title, path, metadata, and cached text preview.
 - `?`: show key help.
-- `r`: refresh the selected record in memory.
+- `r`: refresh the selected record and write the updated cache.
 - `Enter`: execute `xdg-open` for the selected document.
 - `e`: edit the selected text-source document in `$VISUAL`, `$EDITOR`, or `vim`.
 - `x`: execute `xdg-open` for the selected document.
@@ -361,8 +373,8 @@ current supported document set, Markdown and RTF are treated as text-source
 formats. PDF, DOCX, and ODT are not edited through `e`; use `x` for those.
 
 After an editor exits, Kannon redraws the current TUI view. If the file content
-changed and you want the cached thumbnail and metadata regenerated, rerun with
-`--refresh`.
+changed, press `r` to refresh the selected record and update `kannon.yaml`.
+Rerun with `--refresh` when you want to regenerate every cached record.
 
 ## Cache Format
 
@@ -400,6 +412,9 @@ documents:
 
 Cached records are reused when the source file size, source `mtime_ns`, and
 configured thumbnail size still match. Use `--refresh` to force regeneration.
+In the TUI, changed files are refreshed automatically unless `--watch off` is
+set. If a watched file is deleted, Kannon keeps the last cached preview but marks
+the record as stale in metadata.
 
 ## Metadata
 

@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-import getpass
 import io
 import os
-import pwd
 import re
 import select
 import shlex
@@ -18,14 +16,30 @@ import textwrap
 import tty
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from xml.etree import ElementTree
 
-from .cache import CACHE_VERSION, load_cache as read_cache, save_cache as write_cache
+from .cache import load_cache as read_cache, save_cache as write_cache
 from .deps import ImportStatus, import_available, run_doctor
+from .documents import (
+    DOCX_EXTENSIONS,
+    DOCUMENT_TYPES,
+    MARKDOWN_EXTENSIONS,
+    ODT_EXTENSIONS,
+    PDF_EXTENSIONS,
+    RTF_EXTENSIONS,
+    SORT_KEYS,
+    discover_documents,
+    make_error_record,
+    make_record,
+    record_is_current,
+    short_date,
+    sort_records,
+)
 from .paths import install_command, startup_install_commands, venv_python_command
+from .watch import DocumentWatcher
 
 
 def abort_missing_startup_dependency(
@@ -101,21 +115,7 @@ PIL_STATUS = ImportStatus(
 )
 
 
-PDF_EXTENSIONS = {".pdf"}
-MARKDOWN_EXTENSIONS = {".md", ".markdown"}
-RTF_EXTENSIONS = {".rtf"}
-DOCX_EXTENSIONS = {".docx"}
-ODT_EXTENSIONS = {".odt"}
-SUPPORTED_EXTENSIONS = (
-    PDF_EXTENSIONS
-    | MARKDOWN_EXTENSIONS
-    | RTF_EXTENSIONS
-    | DOCX_EXTENSIONS
-    | ODT_EXTENSIONS
-)
-DOCUMENT_TYPES = "PDF, Markdown, RTF, DOCX, and ODT"
 EDITABLE_TEXT_KINDS = {"markdown", "rtf"}
-SORT_KEYS = ("modified", "created", "title", "path", "kind", "size", "author")
 
 
 @dataclass(frozen=True)
@@ -157,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("-n/--per-page must be 1 or greater")
     if args.size < 1:
         raise SystemExit("--size must be 1 or greater")
+    if args.watch_interval <= 0:
+        raise SystemExit("--watch-interval must be greater than 0")
     if args.ascending and args.descending:
         raise SystemExit("--ascending and --descending are mutually exclusive")
     if args.doctor:
@@ -196,13 +198,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_tui or not (sys.stdin.isatty() and sys.stdout.isatty()):
             render_grid(records, modes[mode_index], selected=0, use_nerd=use_nerd, show_popup=False)
             return 0
-        run_grid_tui(records, modes, mode_index, use_nerd)
+        run_grid_tui(records, modes, mode_index, use_nerd, cache_path, args.size, args.watch, args.watch_interval)
         return 0
     if args.no_tui or not (sys.stdin.isatty() and sys.stdout.isatty()):
         render_page(records, modes[mode_index], start_index=0, per_page=args.per_page, use_nerd=use_nerd)
         return 0
 
-    run_tui(records, modes, mode_index, args.per_page, use_nerd)
+    run_tui(records, modes, mode_index, args.per_page, use_nerd, cache_path, args.size, args.watch, args.watch_interval)
     return 0
 
 
@@ -302,6 +304,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use plain ASCII labels instead of Nerd Font glyphs in the terminal UI.",
     )
     parser.add_argument(
+        "--watch",
+        choices=("auto", "inotify", "poll", "off"),
+        default="auto",
+        help="Refresh changed documents while the TUI is open. Default: auto.",
+    )
+    parser.add_argument(
+        "--watch-interval",
+        type=float,
+        default=1.0,
+        help="Polling interval in seconds for --watch auto or --watch poll. Default: 1.0.",
+    )
+    parser.add_argument(
         "--scan-only",
         action="store_true",
         help="Only scan and update kannon.yaml; do not render a preview.",
@@ -327,60 +341,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --doctor, also offer system package-manager repair commands.",
     )
     return parser
-
-
-def discover_documents(paths: Iterable[Path]) -> list[Path]:
-    found: list[Path] = []
-    seen: set[Path] = set()
-    for path in paths:
-        if not safe_exists(path):
-            print(f"warning: {path} does not exist", file=sys.stderr)
-            continue
-        candidates: Iterable[Path] = path.rglob("*") if safe_is_dir(path) else [path]
-        try:
-            iterator = iter(candidates)
-            for candidate in iterator:
-                if not safe_is_file(candidate):
-                    continue
-                if candidate.name == "kannon.yaml":
-                    continue
-                if candidate.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                    continue
-                try:
-                    resolved = candidate.resolve()
-                except OSError as exc:
-                    print(f"warning: cannot resolve {candidate}: {exc}", file=sys.stderr)
-                    continue
-                if resolved not in seen:
-                    found.append(resolved)
-                    seen.add(resolved)
-        except OSError as exc:
-            print(f"warning: cannot scan {path}: {exc}", file=sys.stderr)
-    return sorted(found, key=lambda p: str(p).lower())
-
-
-def safe_is_file(candidate: Path) -> bool:
-    try:
-        return candidate.is_file()
-    except OSError as exc:
-        print(f"warning: cannot inspect {candidate}: {exc}", file=sys.stderr)
-        return False
-
-
-def safe_is_dir(candidate: Path) -> bool:
-    try:
-        return candidate.is_dir()
-    except OSError as exc:
-        print(f"warning: cannot inspect {candidate}: {exc}", file=sys.stderr)
-        return False
-
-
-def safe_exists(candidate: Path) -> bool:
-    try:
-        return candidate.exists()
-    except OSError as exc:
-        print(f"warning: cannot inspect {candidate}: {exc}", file=sys.stderr)
-        return False
 
 
 def print_dependency_warnings(documents: list[Path]) -> None:
@@ -516,75 +476,6 @@ def build_records(
     return records
 
 
-def sort_records(records: list[dict[str, Any]], key_name: str, descending: bool) -> list[dict[str, Any]]:
-    if key_name not in SORT_KEYS:
-        raise SystemExit(f"unsupported sort key: {key_name}")
-    present = [record for record in records if sort_value(record, key_name)[0] == 1]
-    missing = [record for record in records if sort_value(record, key_name)[0] == 0]
-    present.sort(key=lambda record: sort_value(record, key_name)[1], reverse=descending)
-    missing.sort(key=lambda record: str(record.get("path") or record.get("path_abs") or "").casefold())
-    return present + missing
-
-
-def sort_value(record: dict[str, Any], key_name: str) -> tuple[int, str | int]:
-    source = record.get("source", {})
-    metadata = record.get("metadata", {})
-    if not isinstance(source, dict):
-        source = {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-    if key_name == "modified":
-        return sortable_datetime(source.get("modified"))
-    if key_name == "created":
-        return sortable_datetime(source.get("created"))
-    if key_name == "title":
-        return sortable_text(record.get("title"))
-    if key_name == "path":
-        return sortable_text(record.get("path") or record.get("path_abs"))
-    if key_name == "kind":
-        return sortable_text(record.get("kind"))
-    if key_name == "size":
-        return sortable_number(source.get("size_bytes"))
-    if key_name == "author":
-        return sortable_text(metadata.get("author") or metadata.get("Author") or metadata.get("creator"))
-    return sortable_text(record.get("path"))
-
-
-def sortable_datetime(value: Any) -> tuple[int, str]:
-    if value is None:
-        return (0, "")
-    text = str(value)
-    if text.endswith(" (ctime)"):
-        text = text.removesuffix(" (ctime)")
-    return (1, text)
-
-
-def sortable_text(value: Any) -> tuple[int, str]:
-    if value is None:
-        return (0, "")
-    text = str(value).casefold()
-    return (1, text)
-
-
-def sortable_number(value: Any) -> tuple[int, int]:
-    try:
-        return (1, int(value))
-    except (TypeError, ValueError):
-        return (0, 0)
-
-
-def record_is_current(record: dict[str, Any], stat: os.stat_result, thumbnail_size: int) -> bool:
-    source = record.get("source", {})
-    thumbnail = record.get("thumbnail", {})
-    if not isinstance(source, dict) or not isinstance(thumbnail, dict):
-        return False
-    return (
-        source.get("mtime_ns") == stat.st_mtime_ns
-        and source.get("size_bytes") == stat.st_size
-        and thumbnail.get("max_edge") == thumbnail_size
-    )
-
-
 def index_document(document: Path, stat: os.stat_result, thumbnail_size: int) -> dict[str, Any]:
     suffix = document.suffix.lower()
     if suffix in PDF_EXTENSIONS:
@@ -605,59 +496,27 @@ def index_document(document: Path, stat: os.stat_result, thumbnail_size: int) ->
     else:
         raise ValueError(f"unsupported document type: {suffix}")
 
-    png = image_to_png_bytes(image)
-    owner = owner_name(stat.st_uid)
-    current_user = getpass.getuser()
     title = clean_metadata_value(metadata.get("title")) or document.stem
-
-    record = {
-        "path": display_path(document),
-        "path_abs": str(document),
-        "kind": kind,
-        "title": title,
-        "source": {
-            "size_bytes": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-            "created": source_created_iso(stat),
-            "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-            "owner_user": owner,
-        },
-        "metadata": compact_metadata(metadata),
-        "text_preview": preview_text[:6000],
-        "thumbnail": {
+    return make_record(
+        document=document,
+        stat=stat,
+        kind=kind,
+        title=str(title),
+        metadata=compact_metadata(metadata),
+        text_preview=preview_text,
+        thumbnail={
             "media_type": "image/png",
             "encoding": "base64",
             "max_edge": thumbnail_size,
             "width": image.width,
             "height": image.height,
-            "data": base64.b64encode(png).decode("ascii"),
+            "data": base64.b64encode(image_to_png_bytes(image)).decode("ascii"),
         },
-    }
-    if owner and owner != current_user:
-        record["user_name"] = owner
-    return record
+    )
 
 
 def error_record(document: Path, stat: os.stat_result, exc: Exception) -> dict[str, Any]:
-    owner = owner_name(stat.st_uid)
-    record: dict[str, Any] = {
-        "path": display_path(document),
-        "path_abs": str(document),
-        "kind": document.suffix.lower().lstrip(".") or "unknown",
-        "title": document.stem,
-        "source": {
-            "size_bytes": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-            "created": source_created_iso(stat),
-            "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-            "owner_user": owner,
-        },
-        "metadata": error_metadata(exc),
-        "text_preview": "",
-    }
-    if owner and owner != getpass.getuser():
-        record["user_name"] = owner
-    return record
+    return make_error_record(document, stat, error_metadata(exc))
 
 
 def error_metadata(exc: Exception) -> dict[str, Any]:
@@ -1434,27 +1293,6 @@ def normalize_pdf_date(value: str) -> str | None:
         return None
 
 
-def owner_name(uid: int) -> str | None:
-    try:
-        return pwd.getpwuid(uid).pw_name
-    except KeyError:
-        return str(uid)
-
-
-def source_created_iso(stat: os.stat_result) -> str:
-    birth_time = getattr(stat, "st_birthtime", None)
-    if birth_time is not None:
-        return datetime.fromtimestamp(birth_time, timezone.utc).isoformat()
-    return datetime.fromtimestamp(stat.st_ctime, timezone.utc).isoformat() + " (ctime)"
-
-
-def display_path(path: Path) -> str:
-    try:
-        return str(path.relative_to(Path.cwd()))
-    except ValueError:
-        return str(path)
-
-
 def available_render_modes(args: argparse.Namespace) -> list[RenderMode]:
     modes = [RenderMode("text", "text only")]
     if shutil.which("chafa") and not args.no_chafa:
@@ -1563,16 +1401,25 @@ def run_tui(
     mode_index: int,
     per_page: int,
     use_nerd: bool,
+    cache_path: Path,
+    thumbnail_size: int,
+    watch_mode: str,
+    watch_interval: float,
 ) -> None:
     index = 0
+    watcher = make_watcher(records, watch_mode, watch_interval)
     with RawTerminal() as terminal:
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
+        show_watcher_message(watcher, terminal)
         try:
             while True:
+                refresh_changed_records(watcher, records, cache_path, thumbnail_size, terminal)
                 mode = modes[mode_index]
                 render_page(records, mode, start_index=index, per_page=per_page, use_nerd=use_nerd)
                 key = read_key()
+                if not key:
+                    continue
                 if key in {"q", "Q", "\x03", "\x04"}:
                     break
                 if key in {"m", "M", "\t", "backtab"}:
@@ -1588,6 +1435,8 @@ def run_tui(
                     continue
                 if key in {"r", "R"}:
                     records[index] = refresh_record(records[index], terminal)
+                    update_watcher_record(watcher, index, records[index])
+                    persist_records(cache_path, records, thumbnail_size, terminal)
                     continue
                 if key in {"x", "X"}:
                     open_record_external(records[index], terminal)
@@ -1607,21 +1456,36 @@ def run_tui(
                 elif key == "end":
                     index = max(0, len(records) - per_page)
         finally:
+            close_watcher(watcher)
             sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
             sys.stdout.flush()
 
 
-def run_grid_tui(records: list[dict[str, Any]], modes: list[RenderMode], mode_index: int, use_nerd: bool) -> None:
+def run_grid_tui(
+    records: list[dict[str, Any]],
+    modes: list[RenderMode],
+    mode_index: int,
+    use_nerd: bool,
+    cache_path: Path,
+    thumbnail_size: int,
+    watch_mode: str,
+    watch_interval: float,
+) -> None:
     selected = 0
     show_popup = False
+    watcher = make_watcher(records, watch_mode, watch_interval)
     with RawTerminal() as terminal:
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
+        show_watcher_message(watcher, terminal)
         try:
             while True:
+                refresh_changed_records(watcher, records, cache_path, thumbnail_size, terminal)
                 mode = modes[mode_index]
                 render_grid(records, mode, selected=selected, use_nerd=use_nerd, show_popup=show_popup)
                 key = read_key()
+                if not key:
+                    continue
                 if key in {"q", "Q", "\x03", "\x04", "esc"}:
                     if show_popup and key == "esc":
                         show_popup = False
@@ -1644,6 +1508,8 @@ def run_grid_tui(records: list[dict[str, Any]], modes: list[RenderMode], mode_in
                     continue
                 if key in {"r", "R"}:
                     records[selected] = refresh_record(records[selected], terminal)
+                    update_watcher_record(watcher, selected, records[selected])
+                    persist_records(cache_path, records, thumbnail_size, terminal)
                     continue
                 if key in {"x", "X"}:
                     open_record_external(records[selected], terminal)
@@ -1669,6 +1535,7 @@ def run_grid_tui(records: list[dict[str, Any]], modes: list[RenderMode], mode_in
                 elif key == "end":
                     selected = len(records) - 1
         finally:
+            close_watcher(watcher)
             sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
             sys.stdout.flush()
 
@@ -1738,18 +1605,102 @@ def edit_record_terminal(record: dict[str, Any], terminal: "RawTerminal | None" 
         enter_tui_screen(terminal)
 
 
-def refresh_record(record: dict[str, Any], terminal: "RawTerminal | None" = None) -> dict[str, Any]:
+def refresh_record(
+    record: dict[str, Any],
+    terminal: "RawTerminal | None" = None,
+    notify: bool = True,
+) -> dict[str, Any]:
     path_text = str(record.get("path_abs") or record.get("path") or "")
     path = Path(path_text).expanduser()
     if not path_text or not path.exists():
-        notify_tui_message("Cannot refresh document because its source path is missing.", terminal)
+        if notify:
+            notify_tui_message("Cannot refresh document because its source path is missing.", terminal)
         return record
     thumbnail_size = int(record.get("thumbnail", {}).get("max_edge") or 512) if isinstance(record.get("thumbnail"), dict) else 512
     try:
         return index_document(path, path.stat(), thumbnail_size)
     except Exception as exc:
-        notify_tui_message(f"Cannot refresh {path}: {type(exc).__name__}: {exc}", terminal)
+        if notify:
+            notify_tui_message(f"Cannot refresh {path}: {type(exc).__name__}: {exc}", terminal)
         return record
+
+
+def make_watcher(records: list[dict[str, Any]], watch_mode: str, watch_interval: float) -> DocumentWatcher | None:
+    if watch_mode == "off":
+        return None
+    return DocumentWatcher(records, watch_mode, watch_interval)
+
+
+def close_watcher(watcher: DocumentWatcher | None) -> None:
+    if watcher is not None:
+        watcher.close()
+
+
+def show_watcher_message(watcher: DocumentWatcher | None, terminal: "RawTerminal | None" = None) -> None:
+    if watcher is not None and watcher.message:
+        notify_tui_message(watcher.message, terminal)
+
+
+def refresh_changed_records(
+    watcher: DocumentWatcher | None,
+    records: list[dict[str, Any]],
+    cache_path: Path,
+    thumbnail_size: int,
+    terminal: "RawTerminal | None" = None,
+) -> None:
+    if watcher is None:
+        return
+    changed = watcher.changed_indices(records)
+    if not changed:
+        return
+    refreshed = 0
+    for index in changed:
+        old_record = records[index]
+        new_record = refresh_record(old_record, terminal, notify=False)
+        if new_record is not old_record:
+            records[index] = new_record
+            update_watcher_record(watcher, index, new_record)
+            refreshed += 1
+        else:
+            if mark_missing_source(old_record):
+                refreshed += 1
+            watcher.mark_seen(index, old_record)
+    if refreshed:
+        persist_records(cache_path, records, thumbnail_size, terminal)
+
+
+def update_watcher_record(watcher: DocumentWatcher | None, index: int, record: dict[str, Any]) -> None:
+    if watcher is not None:
+        watcher.update_record(index, record)
+
+
+def mark_missing_source(record: dict[str, Any]) -> bool:
+    path_text = str(record.get("path_abs") or record.get("path") or "")
+    if path_text and Path(path_text).expanduser().exists():
+        return False
+    metadata = record.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+        record["metadata"] = metadata
+    changed = metadata.get("source_missing") is not True
+    metadata["source_missing"] = True
+    metadata["warning"] = "Source file is missing; this preview is stale."
+    source = record.setdefault("source", {})
+    if isinstance(source, dict):
+        source["missing"] = True
+    return changed
+
+
+def persist_records(
+    cache_path: Path,
+    records: list[dict[str, Any]],
+    thumbnail_size: int,
+    terminal: "RawTerminal | None" = None,
+) -> None:
+    try:
+        write_cache(cache_path, records, thumbnail_size, yaml)
+    except SystemExit as exc:
+        notify_tui_message(str(exc), terminal)
 
 
 def prompt_search(records: list[dict[str, Any]], start_index: int, terminal: "RawTerminal | None" = None) -> int | None:
@@ -1802,7 +1753,7 @@ def show_help_popup(terminal: "RawTerminal | None" = None) -> None:
                 "  m or Tab: next render mode",
                 "  M or Shift-Tab: previous render mode",
                 "  /: search title, path, metadata, and cached text",
-                "  r: refresh selected document in memory",
+                "  r: refresh selected document and cache",
                 "  Space: toggle metadata popup in grid mode",
                 "  Enter or x: open with xdg-open",
                 "  e: edit text-source documents",
@@ -2024,8 +1975,8 @@ def grid_status_bar(
     use_nerd: bool,
 ) -> str:
     icon = "󰆼 " if use_nerd else ""
-    popup = "metadata popup open, Space/Esc closes" if show_popup else "Space metadata, arrows move"
-    text = f"{icon}[grid/{mode}] selected {selected + 1}/{total} {popup}, m/Tab mode, / search, ? help, q quits"
+    popup = "popup open, Space/Esc closes" if show_popup else "Space meta, arrows move"
+    text = f"{icon}[grid/{mode}] {selected + 1}/{total} {popup}, m/Tab mode, / search, ? help, q quit"
     text = truncate_plain(text, width)
     return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"
 
@@ -2349,20 +2300,10 @@ def status_bar(start_index: int, total: int, per_page: int, mode: str, width: in
     nav_icon = "󰁔 " if use_nerd else ""
     text = (
         f"{nav_icon}[{mode}] showing {start_index + 1}-{end_index}/{total} "
-        f"per-page={per_page} arrows/j/k page, m/Tab mode, / search, ? help, Enter/x opens, q quits"
+        f"-n {per_page}, arrows/j/k page, m/Tab mode, / search, ? help, Enter/x open, q quit"
     )
     text = truncate_plain(text, width)
     return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"
-
-
-def short_date(value: Any) -> str:
-    if value is None:
-        return "unknown"
-    text = str(value)
-    match = re.match(r"(\d{4}-\d{2}-\d{2})", text)
-    if match:
-        return match.group(1)
-    return text[:10] if text else "unknown"
 
 
 def truncate_plain(text: str, width: int) -> str:
