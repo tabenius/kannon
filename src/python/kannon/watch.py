@@ -104,7 +104,8 @@ class InotifyBackend:
 
 class DocumentWatcher:
     def __init__(self, records: list[dict[str, Any]], mode: str, interval: float) -> None:
-        self.requested_mode = mode
+        if mode not in {"auto", "inotify", "poll"}:
+            raise ValueError(f"unsupported watch mode: {mode}")
         self.interval = max(0.1, interval)
         self.last_poll = 0.0
         self.signatures = [record_signature(record) for record in records]
@@ -123,7 +124,6 @@ class DocumentWatcher:
             except OSError as exc:
                 if mode == "inotify":
                     self.message = f"inotify unavailable ({exc}); using polling instead."
-        self.active_mode = "inotify+poll" if self.backend is not None else "poll"
 
     def close(self) -> None:
         if self.backend is not None:
@@ -170,7 +170,12 @@ class DocumentWatcher:
 
 
 def sys_platform_is_linux() -> bool:
-    return os.uname().sysname == "Linux" if hasattr(os, "uname") else False
+    if not hasattr(os, "uname"):
+        return False
+    try:
+        return os.uname().sysname == "Linux"
+    except OSError:
+        return False
 
 
 def record_path(record: dict[str, Any]) -> Path | None:

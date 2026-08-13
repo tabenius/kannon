@@ -280,7 +280,8 @@ While the TUI is open, Kannon watches the indexed files for changes and
 auto-refreshes changed records in the cache. On Linux it uses native inotify
 plus periodic polling by default. On other platforms, or when inotify is not
 available, it uses polling. Use `--watch off` to disable this, `--watch poll` to
-force polling, or `--watch-interval 2.5` to make polling less frequent.
+force polling, or `--watch-interval 2.5` to make polling less frequent. The TUI
+waits for keys or watch events and redraws only when visible state changes.
 
 The preview is drawn at roughly 75% of terminal width, with metadata shown to the
 right. By default Kannon fits one thumbnail per terminal page. Use `-n 2`,

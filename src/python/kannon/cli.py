@@ -13,6 +13,7 @@ import sys
 import tempfile
 import termios
 import textwrap
+import time
 import tty
 import zipfile
 from dataclasses import dataclass
@@ -124,6 +125,22 @@ class RenderMode:
     label: str
     forced: bool = False
     chafa_format: str | None = None
+
+
+@dataclass
+class StatusMessage:
+    text: str = ""
+    expires_at: float = 0.0
+
+    def show(self, text: str, ttl: float = 3.0) -> None:
+        self.text = text
+        self.expires_at = time.monotonic() + ttl
+
+    def current(self) -> str | None:
+        if self.text and time.monotonic() < self.expires_at:
+            return self.text
+        self.text = ""
+        return None
 
 
 class KannonError(Exception):
@@ -1408,53 +1425,75 @@ def run_tui(
 ) -> None:
     index = 0
     watcher = make_watcher(records, watch_mode, watch_interval)
+    status = StatusMessage()
+    if watcher is not None and watcher.message:
+        status.show(watcher.message, ttl=5.0)
+    dirty = True
+    last_message: str | None = None
     with RawTerminal() as terminal:
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
-        show_watcher_message(watcher, terminal)
         try:
             while True:
-                refresh_changed_records(watcher, records, cache_path, thumbnail_size, terminal)
-                mode = modes[mode_index]
-                render_page(records, mode, start_index=index, per_page=per_page, use_nerd=use_nerd)
-                key = read_key()
+                dirty = refresh_changed_records(watcher, records, cache_path, thumbnail_size, status) or dirty
+                message = status.current()
+                if message != last_message:
+                    dirty = True
+                if dirty or message:
+                    mode = modes[mode_index]
+                    render_page(records, mode, start_index=index, per_page=per_page, use_nerd=use_nerd, message=message)
+                    dirty = False
+                    last_message = message
+                key = read_key(watch_poll_timeout(watcher))
                 if not key:
                     continue
                 if key in {"q", "Q", "\x03", "\x04"}:
                     break
                 if key in {"m", "M", "\t", "backtab"}:
                     mode_index = cycle_render_mode(modes, mode_index, -1 if key in {"M", "backtab"} else 1)
+                    dirty = True
                     continue
                 if key == "?":
                     show_help_popup(terminal)
+                    dirty = True
                     continue
                 if key == "/":
                     match = prompt_search(records, index, terminal)
                     if match is not None:
                         index = match
+                    dirty = True
                     continue
                 if key in {"r", "R"}:
                     records[index] = refresh_record(records[index], terminal)
                     update_watcher_record(watcher, index, records[index])
                     persist_records(cache_path, records, thumbnail_size, terminal)
+                    status.show("Refreshed selected document and cache.")
+                    dirty = True
                     continue
                 if key in {"x", "X"}:
                     open_record_external(records[index], terminal)
+                    dirty = True
                     continue
                 if key in {"\r", "\n"}:
                     open_record_external(records[index], terminal)
+                    dirty = True
                     continue
                 if key in {"e", "E"}:
                     edit_record_terminal(records[index], terminal)
+                    dirty = True
                     continue
                 if key in {"right", "down", "j", "n", " "}:
                     index = min(index + per_page, max(0, len(records) - 1))
+                    dirty = True
                 elif key in {"left", "up", "k", "p"}:
                     index = max(index - per_page, 0)
+                    dirty = True
                 elif key == "home":
                     index = 0
+                    dirty = True
                 elif key == "end":
                     index = max(0, len(records) - per_page)
+                    dirty = True
         finally:
             close_watcher(watcher)
             sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
@@ -1474,66 +1513,92 @@ def run_grid_tui(
     selected = 0
     show_popup = False
     watcher = make_watcher(records, watch_mode, watch_interval)
+    status = StatusMessage()
+    if watcher is not None and watcher.message:
+        status.show(watcher.message, ttl=5.0)
+    dirty = True
+    last_message: str | None = None
     with RawTerminal() as terminal:
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
-        show_watcher_message(watcher, terminal)
         try:
             while True:
-                refresh_changed_records(watcher, records, cache_path, thumbnail_size, terminal)
-                mode = modes[mode_index]
-                render_grid(records, mode, selected=selected, use_nerd=use_nerd, show_popup=show_popup)
-                key = read_key()
+                dirty = refresh_changed_records(watcher, records, cache_path, thumbnail_size, status) or dirty
+                message = status.current()
+                if message != last_message:
+                    dirty = True
+                if dirty or message:
+                    mode = modes[mode_index]
+                    render_grid(records, mode, selected=selected, use_nerd=use_nerd, show_popup=show_popup, message=message)
+                    dirty = False
+                    last_message = message
+                key = read_key(watch_poll_timeout(watcher))
                 if not key:
                     continue
                 if key in {"q", "Q", "\x03", "\x04", "esc"}:
                     if show_popup and key == "esc":
                         show_popup = False
+                        dirty = True
                         continue
                     break
                 if key == " ":
                     show_popup = not show_popup
+                    dirty = True
                     continue
                 if key in {"m", "M", "\t", "backtab"}:
                     mode_index = cycle_render_mode(modes, mode_index, -1 if key in {"M", "backtab"} else 1)
+                    dirty = True
                     continue
                 if key == "?":
                     show_help_popup(terminal)
+                    dirty = True
                     continue
                 if key == "/":
                     match = prompt_search(records, selected, terminal)
                     if match is not None:
                         selected = match
                         show_popup = False
+                    dirty = True
                     continue
                 if key in {"r", "R"}:
                     records[selected] = refresh_record(records[selected], terminal)
                     update_watcher_record(watcher, selected, records[selected])
                     persist_records(cache_path, records, thumbnail_size, terminal)
+                    status.show("Refreshed selected document and cache.")
+                    dirty = True
                     continue
                 if key in {"x", "X"}:
                     open_record_external(records[selected], terminal)
+                    dirty = True
                     continue
                 if key in {"\r", "\n"}:
                     open_record_external(records[selected], terminal)
+                    dirty = True
                     continue
                 if key in {"e", "E"}:
                     edit_record_terminal(records[selected], terminal)
+                    dirty = True
                     continue
                 if show_popup:
                     continue
                 if key in {"right", "l", "n"}:
                     selected = min(selected + 1, len(records) - 1)
+                    dirty = True
                 elif key in {"left", "h", "p"}:
                     selected = max(selected - 1, 0)
+                    dirty = True
                 elif key in {"down", "j"}:
                     selected = min(selected + 2, len(records) - 1)
+                    dirty = True
                 elif key in {"up", "k"}:
                     selected = max(selected - 2, 0)
+                    dirty = True
                 elif key == "home":
                     selected = 0
+                    dirty = True
                 elif key == "end":
                     selected = len(records) - 1
+                    dirty = True
         finally:
             close_watcher(watcher)
             sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
@@ -1636,27 +1701,22 @@ def close_watcher(watcher: DocumentWatcher | None) -> None:
         watcher.close()
 
 
-def show_watcher_message(watcher: DocumentWatcher | None, terminal: "RawTerminal | None" = None) -> None:
-    if watcher is not None and watcher.message:
-        notify_tui_message(watcher.message, terminal)
-
-
 def refresh_changed_records(
     watcher: DocumentWatcher | None,
     records: list[dict[str, Any]],
     cache_path: Path,
     thumbnail_size: int,
-    terminal: "RawTerminal | None" = None,
-) -> None:
+    status: StatusMessage,
+) -> bool:
     if watcher is None:
-        return
+        return False
     changed = watcher.changed_indices(records)
     if not changed:
-        return
+        return False
     refreshed = 0
     for index in changed:
         old_record = records[index]
-        new_record = refresh_record(old_record, terminal, notify=False)
+        new_record = refresh_record(old_record, None, notify=False)
         if new_record is not old_record:
             records[index] = new_record
             update_watcher_record(watcher, index, new_record)
@@ -1666,12 +1726,25 @@ def refresh_changed_records(
                 refreshed += 1
             watcher.mark_seen(index, old_record)
     if refreshed:
-        persist_records(cache_path, records, thumbnail_size, terminal)
+        suffix = "" if refreshed == 1 else "s"
+        try:
+            write_cache(cache_path, records, thumbnail_size, yaml)
+            status.show(f"Auto-refreshed {refreshed} changed document{suffix}.")
+        except SystemExit as exc:
+            status.show(f"Auto-refreshed {refreshed} changed document{suffix}, but cache write failed: {exc}", ttl=8.0)
+        return True
+    return False
 
 
 def update_watcher_record(watcher: DocumentWatcher | None, index: int, record: dict[str, Any]) -> None:
     if watcher is not None:
         watcher.update_record(index, record)
+
+
+def watch_poll_timeout(watcher: DocumentWatcher | None) -> float:
+    if watcher is None:
+        return 0.25
+    return max(0.05, min(0.5, watcher.interval))
 
 
 def mark_missing_source(record: dict[str, Any]) -> bool:
@@ -1831,7 +1904,9 @@ class RawTerminal:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
 
-def read_key() -> str:
+def read_key(timeout: float = 0.25) -> str:
+    if not select.select([sys.stdin], [], [], max(0.0, timeout))[0]:
+        return ""
     ch = sys.stdin.read(1)
     if ch != "\x1b":
         return ch
@@ -1860,17 +1935,18 @@ def render_page(
     start_index: int,
     per_page: int,
     use_nerd: bool,
+    message: str | None = None,
 ) -> None:
     terminal = shutil.get_terminal_size((100, 30))
     visible = records[start_index : start_index + per_page]
     if mode.name == "text":
-        render_text_screen(records, visible, terminal, start_index, per_page, use_nerd)
+        render_text_screen(records, visible, terminal, start_index, per_page, use_nerd, message)
     elif mode.name == "chafa":
-        render_chafa_screen(records, visible, terminal, start_index, per_page, use_nerd, mode)
+        render_chafa_screen(records, visible, terminal, start_index, per_page, use_nerd, mode, message)
     elif mode.name == "sixel":
-        render_sixel_screen(records, visible, terminal, start_index, per_page, use_nerd)
+        render_sixel_screen(records, visible, terminal, start_index, per_page, use_nerd, message)
     else:
-        render_ansi_screen(records, visible, terminal, start_index, per_page, use_nerd)
+        render_ansi_screen(records, visible, terminal, start_index, per_page, use_nerd, message)
 
 
 def render_grid(
@@ -1879,6 +1955,7 @@ def render_grid(
     selected: int,
     use_nerd: bool,
     show_popup: bool,
+    message: str | None = None,
 ) -> None:
     terminal = shutil.get_terminal_size((100, 30))
     sys.stdout.write("\x1b[2J\x1b[H")
@@ -1907,7 +1984,7 @@ def render_grid(
         draw_metadata_popup(records[selected], terminal, selected, len(records), use_nerd)
     sys.stdout.write(
         f"\x1b[{terminal.lines};1H"
-        f"{grid_status_bar(selected, len(records), mode.label, terminal.columns, show_popup, use_nerd)}"
+        f"{grid_status_bar(selected, len(records), mode.label, terminal.columns, show_popup, use_nerd, message)}"
     )
     sys.stdout.flush()
 
@@ -1973,10 +2050,14 @@ def grid_status_bar(
     width: int,
     show_popup: bool,
     use_nerd: bool,
+    message: str | None = None,
 ) -> str:
     icon = "󰆼 " if use_nerd else ""
-    popup = "popup open, Space/Esc closes" if show_popup else "Space meta, arrows move"
-    text = f"{icon}[grid/{mode}] {selected + 1}/{total} {popup}, m/Tab mode, / search, ? help, q quit"
+    if message:
+        text = f"{icon}[grid/{mode}] {selected + 1}/{total} {message}"
+    else:
+        popup = "popup open, Space/Esc closes" if show_popup else "Space meta, arrows move"
+        text = f"{icon}[grid/{mode}] {selected + 1}/{total} {popup}, m/Tab mode, / search, ? help, q quit"
     text = truncate_plain(text, width)
     return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"
 
@@ -2012,6 +2093,7 @@ def render_text_screen(
     start_index: int,
     per_page: int,
     use_nerd: bool,
+    message: str | None = None,
 ) -> None:
     sys.stdout.write("\x1b[2J\x1b[H")
     slot_height = preview_slot_height(terminal.lines, per_page)
@@ -2028,7 +2110,7 @@ def render_text_screen(
     footer_row = terminal.lines
     sys.stdout.write(
         f"\x1b[{footer_row};1H"
-        f"{status_bar(start_index, len(records), per_page, 'text only', terminal.columns, use_nerd)}"
+        f"{status_bar(start_index, len(records), per_page, 'text only', terminal.columns, use_nerd, message)}"
     )
     sys.stdout.flush()
 
@@ -2041,6 +2123,7 @@ def render_chafa_screen(
     per_page: int,
     use_nerd: bool,
     mode: RenderMode,
+    message: str | None = None,
 ) -> None:
     sys.stdout.write("\x1b[2J\x1b[H")
     slot_height = preview_slot_height(terminal.lines, per_page)
@@ -2071,7 +2154,7 @@ def render_chafa_screen(
     footer_row = terminal.lines
     sys.stdout.write(
         f"\x1b[{footer_row};1H"
-        f"{status_bar(start_index, len(records), per_page, mode.label, terminal.columns, use_nerd)}"
+        f"{status_bar(start_index, len(records), per_page, mode.label, terminal.columns, use_nerd, message)}"
     )
     sys.stdout.flush()
 
@@ -2083,6 +2166,7 @@ def render_sixel_screen(
     start_index: int,
     per_page: int,
     use_nerd: bool,
+    message: str | None = None,
 ) -> None:
     sys.stdout.write("\x1b[2J\x1b[H")
     slot_height = preview_slot_height(terminal.lines, per_page)
@@ -2111,7 +2195,7 @@ def render_sixel_screen(
     footer_row = terminal.lines
     sys.stdout.write(
         f"\x1b[{footer_row};1H"
-        f"{status_bar(start_index, len(records), per_page, mode.label, terminal.columns, use_nerd)}"
+        f"{status_bar(start_index, len(records), per_page, mode.label, terminal.columns, use_nerd, message)}"
     )
     sys.stdout.flush()
 
@@ -2123,6 +2207,7 @@ def render_ansi_screen(
     start_index: int,
     per_page: int,
     use_nerd: bool,
+    message: str | None = None,
 ) -> None:
     sys.stdout.write("\x1b[2J\x1b[H")
     slot_height = preview_slot_height(terminal.lines, per_page)
@@ -2144,7 +2229,9 @@ def render_ansi_screen(
             right = meta[row] if row < len(meta) else ""
             sys.stdout.write(left + "\x1b[0m" + padding + "  " + truncate_plain(right, meta_width) + "\n")
     sys.stdout.write(
-        "\x1b[0m" + status_bar(start_index, len(records), per_page, mode.label, terminal.columns, use_nerd) + "\n"
+        "\x1b[0m"
+        + status_bar(start_index, len(records), per_page, mode.label, terminal.columns, use_nerd, message)
+        + "\n"
     )
     sys.stdout.flush()
 
@@ -2295,13 +2382,24 @@ def header_line(record: dict[str, Any], width: int, use_nerd: bool) -> str:
     return f"\x1b[48;2;22;78;99m\x1b[38;2;236;253;245m{padded}\x1b[0m"
 
 
-def status_bar(start_index: int, total: int, per_page: int, mode: str, width: int, use_nerd: bool) -> str:
+def status_bar(
+    start_index: int,
+    total: int,
+    per_page: int,
+    mode: str,
+    width: int,
+    use_nerd: bool,
+    message: str | None = None,
+) -> str:
     end_index = min(total, start_index + per_page)
     nav_icon = "󰁔 " if use_nerd else ""
-    text = (
-        f"{nav_icon}[{mode}] showing {start_index + 1}-{end_index}/{total} "
-        f"-n {per_page}, arrows/j/k page, m/Tab mode, / search, ? help, Enter/x open, q quit"
-    )
+    if message:
+        text = f"{nav_icon}[{mode}] showing {start_index + 1}-{end_index}/{total} {message}"
+    else:
+        text = (
+            f"{nav_icon}[{mode}] showing {start_index + 1}-{end_index}/{total} "
+            f"-n {per_page}, arrows/j/k page, m/Tab mode, / search, ? help, Enter/x open, q quit"
+        )
     text = truncate_plain(text, width)
     return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"
 

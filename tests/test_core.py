@@ -7,7 +7,15 @@ from pathlib import Path
 import yaml
 
 from kannon.cache import load_cache, save_cache
-from kannon.cli import compact_record_text, mark_missing_source
+from kannon.cli import (
+    StatusMessage,
+    compact_record_text,
+    grid_status_bar,
+    index_document,
+    mark_missing_source,
+    refresh_changed_records,
+    status_bar,
+)
 from kannon.deps import ImportStatus, doctor_checks, run_doctor_repairs
 from kannon.documents import discover_documents, make_error_record, short_date, sort_records
 from kannon.watch import DocumentWatcher
@@ -116,6 +124,53 @@ def test_mark_missing_source_preserves_stale_preview_with_warning(tmp_path: Path
     assert record["metadata"]["source_missing"] is True
     assert "stale" in record["metadata"]["warning"]
     assert record["source"]["missing"] is True
+
+
+def test_refresh_changed_records_is_noop_without_watcher(tmp_path: Path) -> None:
+    cache_path = tmp_path / "kannon.yaml"
+    status = StatusMessage()
+    assert refresh_changed_records(None, [], cache_path, 512, status) is False
+    assert not cache_path.exists()
+
+
+def test_refresh_changed_records_updates_changed_markdown_and_cache(tmp_path: Path) -> None:
+    document = tmp_path / "live.md"
+    cache_path = tmp_path / "kannon.yaml"
+    document.write_text("# Before\n", encoding="utf-8")
+    record = index_document(document, document.stat(), 128)
+    watcher = DocumentWatcher([record], "poll", 0.1)
+    status = StatusMessage()
+    try:
+        document.write_text("# After\n\nUpdated body.\n", encoding="utf-8")
+        new_time = time.time() + 2
+        os.utime(document, (new_time, new_time))
+        watcher.last_poll = 0.0
+        assert refresh_changed_records(watcher, [record], cache_path, 128, status) is True
+        cached = load_cache(cache_path, yaml)
+        assert cached["documents"][0]["title"] == "After"
+        assert "Auto-refreshed 1 changed document." in status.current()
+    finally:
+        watcher.close()
+
+
+def test_status_bars_can_show_transient_messages() -> None:
+    assert "Auto-refreshed" in status_bar(0, 3, 1, "text", 80, False, "Auto-refreshed 1 changed document.")
+    assert "Auto-refreshed" in grid_status_bar(0, 3, "text", 80, False, False, "Auto-refreshed 1 changed document.")
+
+
+def test_status_message_expires() -> None:
+    status = StatusMessage()
+    status.show("short", ttl=-1)
+    assert status.current() is None
+
+
+def test_document_watcher_rejects_unknown_mode() -> None:
+    try:
+        DocumentWatcher([], "bogus", 1.0)
+    except ValueError as exc:
+        assert "unsupported watch mode" in str(exc)
+    else:
+        raise AssertionError("DocumentWatcher accepted an unknown mode")
 
 
 def test_cache_rejects_invalid_documents_list(tmp_path: Path) -> None:
