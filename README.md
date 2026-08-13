@@ -16,6 +16,8 @@ It currently supports:
   standard library.
 - `kannon.yaml` cache output with metadata plus base64-encoded PNG thumbnails.
 - Chafa terminal thumbnail output when the `chafa` command is available.
+- Runtime TUI switching between text-only, Chafa formats, built-in sixel, and
+  built-in ANSI renderers.
 - Built-in sixel image output when explicitly requested or when Chafa is absent
   and the terminal appears to support sixel.
 - Built-in ANSI true-color block output as a fallback or explicit mode.
@@ -46,10 +48,11 @@ local virtual environment exists. Otherwise it falls back to `python3`.
 
 Runtime dependencies are listed in `pyproject.toml`:
 
-- `PyMuPDF>=1.24` for PDF metadata and first-page rendering.
 - `Pillow>=10.0` for image resizing, Markdown rendering, PNG encoding, sixel
   palette preparation, and ANSI block rendering.
 - `PyYAML>=6.0` for reading and writing `kannon.yaml`.
+- Optional extra `pdf` installs `PyMuPDF>=1.24` for primary PDF metadata,
+  first-page rendering, and first-page text extraction.
 
 The same Python dependencies are repeated in `requirements.txt` for users who
 prefer direct virtual-environment workflows. Do not install them with system
@@ -115,11 +118,18 @@ or run the repository wrapper directly:
 ./kannon
 ```
 
-Manual virtual-environment install, useful for development:
+Manual virtual-environment install, useful for development without the optional
+PyMuPDF PDF renderer:
 
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
+```
+
+Manual install with the optional PyMuPDF renderer:
+
+```sh
+.venv/bin/python -m pip install -e '.[pdf]'
 ```
 
 The common failure mode on Kali/Debian/Ubuntu is:
@@ -193,10 +203,22 @@ Force ANSI fallback output:
 kannon --ansi
 ```
 
+Start in metadata and text-only mode:
+
+```sh
+kannon --text
+```
+
 Force Chafa output:
 
 ```sh
 kannon --chafa
+```
+
+Start with a specific Chafa output format:
+
+```sh
+kannon --chafa --chafa-format sixels
 ```
 
 Disable automatic Chafa output:
@@ -238,6 +260,12 @@ TTYs.
 - `Left`, `Up`, `k`, or `p`: previous document.
 - `Home`: first document.
 - `End`: last document.
+- `m`, `Tab`: switch to the next render mode.
+- `M`, `Shift-Tab`: switch to the previous render mode.
+- `/`: search title, path, metadata, and cached text preview.
+- `?`: show key help.
+- `r`: refresh the current record in memory.
+- `Enter`: execute `xdg-open` for the current document.
 - `e`: edit the current text-source document in `$VISUAL`, `$EDITOR`, or `vim`.
 - `x`: execute `xdg-open` for the current document.
 - `q`: quit.
@@ -251,11 +279,13 @@ status bar and gives each preview a colored header line:
 --[ FILENAME ][ CREATION DATE ][ LAST MODIFIED ]
 ```
 
-Chafa is the preferred terminal renderer when available. Kannon invokes it in
-colored symbols mode for reliable side-by-side layout inside the TUI. Built-in
-ANSI mode uses terminal character cells directly. Built-in sixel mode scales the
-image in pixels using an 8-pixel cell-width estimate, then places metadata in the
-right-side terminal columns.
+Chafa is the preferred terminal renderer when available. The TUI can switch at
+runtime between text-only mode, Chafa `symbols`, `sixels`, `kitty`, `iterm`, and
+`ansi` formats, built-in ANSI, and built-in sixel when the terminal appears to
+support sixel or `--sixel` was requested. Built-in ANSI mode uses terminal
+character cells directly. Built-in sixel mode scales the image in pixels using
+an 8-pixel cell-width estimate, then places metadata in the right-side terminal
+columns.
 
 ### Grid Mode
 
@@ -278,15 +308,22 @@ Grid controls:
 - `Home`: first document.
 - `End`: last document.
 - `Space`: open or close the selected document's metadata popup.
+- `m`, `Tab`: switch to the next render mode.
+- `M`, `Shift-Tab`: switch to the previous render mode.
+- `/`: search title, path, metadata, and cached text preview.
+- `?`: show key help.
+- `r`: refresh the selected record in memory.
+- `Enter`: execute `xdg-open` for the selected document.
 - `e`: edit the selected text-source document in `$VISUAL`, `$EDITOR`, or `vim`.
 - `x`: execute `xdg-open` for the selected document.
 - `Esc`: close the popup, or quit when no popup is open.
 - `q`: quit.
 
 Chafa is preferred in grid mode because it can render small terminal-cell
-thumbnails cleanly inside each panel. Built-in ANSI mode is also supported.
-Built-in sixel output is intentionally downgraded to ANSI inside the grid because
-portable sixel cursor placement is unreliable when four images share one screen.
+thumbnails cleanly inside each panel. Text-only and built-in ANSI modes are also
+supported. Built-in sixel output is intentionally downgraded to ANSI inside the
+grid because portable sixel cursor placement is unreliable when four images
+share one screen.
 
 ## Sorting
 
@@ -517,6 +554,15 @@ Run a syntax check:
 ```sh
 python3 -c 'import ast, pathlib; [ast.parse(p.read_text(), filename=str(p)) for p in pathlib.Path("src/python/kannon").glob("*.py")]'
 ```
+
+Run local tests without creating files in the repository:
+
+```sh
+PYTHONPATH=src/python PYTEST_ADDOPTS='-o cache_dir=/tmp/kannon-pytest-cache' python3 -m pytest tests
+```
+
+No GitHub Actions workflow is included yet; use the local test command above
+until remote CI is worth enabling.
 
 Build or install from the project metadata:
 

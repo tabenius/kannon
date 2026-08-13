@@ -1,3 +1,5 @@
 Pillow>=10.0
-PyMuPDF>=1.24
 PyYAML>=6.0
+
+# Optional primary PDF renderer. Markdown, RTF, DOCX, and ODT previews do not need this.
+PyMuPDF>=1.24

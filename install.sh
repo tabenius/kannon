@@ -52,7 +52,7 @@ fi
 
 echo "Installing Kannon Python dependencies into: $VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip
-"$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR"
+"$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR[pdf]"
 
 mkdir -p "$BIN_DIR"
 ln -sf "$ROOT_DIR/kannon" "$BIN_DIR/kannon"

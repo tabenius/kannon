@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
-import importlib.util
 import io
 import os
 import pwd
@@ -24,42 +23,9 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree
 
-
-PROJECT_ROOT = Path(os.environ.get("KANNON_PROJECT_ROOT") or Path(__file__).resolve().parents[3])
-
-
-def project_root() -> Path:
-    return PROJECT_ROOT
-
-
-def install_command() -> str:
-    installer = project_root() / "install.sh"
-    if installer.exists():
-        return f"sh {shlex.quote(str(installer))}"
-    return "sh ./install.sh"
-
-
-def install_command_parts() -> list[str]:
-    installer = project_root() / "install.sh"
-    if installer.exists():
-        return ["sh", str(installer)]
-    return ["sh", "./install.sh"]
-
-
-def venv_python_command(args: str = "") -> str:
-    python = shlex.quote(str(project_root() / ".venv" / "bin" / "python"))
-    base = f"{python} -m pip"
-    return f"{base} {args}".strip()
-
-
-def startup_install_commands(package_name: str) -> list[str]:
-    venv = shlex.quote(str(project_root() / ".venv"))
-    root = shlex.quote(str(project_root()))
-    return [
-        install_command(),
-        f"python3 -m venv {venv} && {venv_python_command('install -e ' + root)}",
-        venv_python_command(f"install {package_name}"),
-    ]
+from .cache import CACHE_VERSION, load_cache as read_cache, save_cache as write_cache
+from .deps import ImportStatus, import_available, run_doctor
+from .paths import install_command, startup_install_commands, venv_python_command
 
 
 def abort_missing_startup_dependency(
@@ -121,6 +87,19 @@ except ModuleNotFoundError as exc:
 else:
     PIL_IMPORT_ERROR = None
 
+YAML_STATUS = ImportStatus(
+    import_name="yaml",
+    package_name="PyYAML",
+    purpose="required for kannon.yaml cache files",
+    missing_error=YAML_IMPORT_ERROR,
+)
+PIL_STATUS = ImportStatus(
+    import_name="PIL",
+    package_name="Pillow",
+    purpose="required for thumbnails and terminal previews",
+    missing_error=PIL_IMPORT_ERROR,
+)
+
 
 PDF_EXTENSIONS = {".pdf"}
 MARKDOWN_EXTENSIONS = {".md", ".markdown"}
@@ -134,7 +113,6 @@ SUPPORTED_EXTENSIONS = (
     | DOCX_EXTENSIONS
     | ODT_EXTENSIONS
 )
-CACHE_VERSION = 1
 DOCUMENT_TYPES = "PDF, Markdown, RTF, DOCX, and ODT"
 EDITABLE_TEXT_KINDS = {"markdown", "rtf"}
 SORT_KEYS = ("modified", "created", "title", "path", "kind", "size", "author")
@@ -143,26 +121,9 @@ SORT_KEYS = ("modified", "created", "title", "path", "kind", "size", "author")
 @dataclass(frozen=True)
 class RenderMode:
     name: str
-    forced: bool = False
-
-
-@dataclass(frozen=True)
-class DoctorFix:
     label: str
-    command: list[str]
-
-    def command_text(self) -> str:
-        return " ".join(shlex.quote(part) for part in self.command)
-
-
-@dataclass(frozen=True)
-class DoctorCheck:
-    name: str
-    ok: bool
-    detail: str
-    purpose: str
-    required: bool = False
-    fix: DoctorFix | None = None
+    forced: bool = False
+    chafa_format: str | None = None
 
 
 class KannonError(Exception):
@@ -199,7 +160,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.ascending and args.descending:
         raise SystemExit("--ascending and --descending are mutually exclusive")
     if args.doctor:
-        return run_doctor()
+        prompt = not args.doctor_check and (args.doctor_fix or sys.stdin.isatty())
+        return run_doctor(YAML_STATUS, PIL_STATUS, prompt=prompt, fix_system=args.doctor_fix_system)
     ensure_startup_dependencies()
     paths = [Path(p).expanduser() for p in args.paths] or [Path.cwd()]
     cache_path = Path(args.cache).expanduser()
@@ -213,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print_dependency_warnings(documents)
 
-    cache = load_cache(cache_path)
+    cache = read_cache(cache_path, yaml)
     records = build_records(
         documents=documents,
         cache=cache,
@@ -221,25 +183,26 @@ def main(argv: list[str] | None = None) -> int:
         refresh=args.refresh,
     )
     records = sort_records(records, args.sort, descending=not args.ascending)
-    save_cache(cache_path, records, args.size)
+    write_cache(cache_path, records, args.size, yaml)
 
     if args.scan_only:
         print(f"Wrote {len(records)} document record(s) to {cache_path}")
         return 0
 
-    mode = choose_render_mode(args)
+    modes = available_render_modes(args)
+    mode_index = initial_render_mode_index(args, modes)
     use_nerd = not args.no_nerd
     if args.grid:
         if args.no_tui or not (sys.stdin.isatty() and sys.stdout.isatty()):
-            render_grid(records, mode, selected=0, use_nerd=use_nerd, show_popup=False)
+            render_grid(records, modes[mode_index], selected=0, use_nerd=use_nerd, show_popup=False)
             return 0
-        run_grid_tui(records, mode, use_nerd)
+        run_grid_tui(records, modes, mode_index, use_nerd)
         return 0
     if args.no_tui or not (sys.stdin.isatty() and sys.stdout.isatty()):
-        render_page(records, mode, start_index=0, per_page=args.per_page, use_nerd=use_nerd)
+        render_page(records, modes[mode_index], start_index=0, per_page=args.per_page, use_nerd=use_nerd)
         return 0
 
-    run_tui(records, mode, args.per_page, use_nerd)
+    run_tui(records, modes, mode_index, args.per_page, use_nerd)
     return 0
 
 
@@ -280,6 +243,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Force rendering thumbnails through the chafa command.",
     )
     parser.add_argument(
+        "--chafa-format",
+        choices=("symbols", "sixels", "kitty", "iterm", "ansi"),
+        default="symbols",
+        help="Initial Chafa output format when --chafa is used. Default: symbols.",
+    )
+    parser.add_argument(
         "--no-chafa",
         action="store_true",
         help="Do not use chafa automatically, even if it is installed.",
@@ -288,6 +257,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--sixel",
         action="store_true",
         help="Force Kannon's built-in sixel output even if terminal detection is unsure.",
+    )
+    parser.add_argument(
+        "--text",
+        action="store_true",
+        help="Render metadata and document text only; do not display thumbnails.",
     )
     parser.add_argument(
         "--no-tui",
@@ -337,165 +311,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Check Kannon's Python and optional system dependencies, then exit.",
     )
+    parser.add_argument(
+        "--doctor-check",
+        action="store_true",
+        help="With --doctor, only report diagnostics and never prompt for repairs.",
+    )
+    parser.add_argument(
+        "--doctor-fix",
+        action="store_true",
+        help="With --doctor, explicitly enable repair prompts. Plain interactive --doctor also prompts.",
+    )
+    parser.add_argument(
+        "--doctor-fix-system",
+        action="store_true",
+        help="With --doctor, also offer system package-manager repair commands.",
+    )
     return parser
-
-
-def run_doctor() -> int:
-    checks = doctor_checks()
-    print("Kannon doctor")
-    print(f"Project root: {project_root()}")
-    print(f"Python: {sys.executable}")
-    print()
-    for check in checks:
-        status = "ok" if check.ok else "missing"
-        print(f"{status:7} {check.name:10} {check.purpose} ({check.detail})")
-    print()
-
-    missing_required = any(check.required and not check.ok for check in checks)
-    fixable = [check for check in checks if not check.ok and check.fix is not None]
-    if fixable:
-        ran_repairs = run_doctor_repairs(fixable)
-        if ran_repairs:
-            print("Repair commands finished. Rerun kannon --doctor so the wrapper can use any new .venv.")
-            print()
-    else:
-        print("No automatic repair commands are available.")
-
-    if any(check.name == "PyMuPDF" and not check.ok for check in checks):
-        print("PyMuPDF is missing. PDFs can still render when pdftoppm is installed, but metadata may vary.")
-        print(f"Preferred fix: {install_command()}")
-    if any(check.name == "chafa" and not check.ok for check in checks):
-        print("Chafa is missing. Kannon will use built-in terminal renderers.")
-        print("Install on Debian/Kali/Ubuntu: sudo apt install chafa")
-    if any(check.name == "xdg-open" and not check.ok for check in checks):
-        print("xdg-open is missing, so the x shortcut cannot open files externally.")
-        print("Install on Debian/Kali/Ubuntu: sudo apt install xdg-utils")
-    print("Doctor finished.")
-    return 2 if missing_required else 0
-
-
-def doctor_checks() -> list[DoctorCheck]:
-    python_dependencies_ok = YAML_IMPORT_ERROR is None and PIL_IMPORT_ERROR is None and import_available("fitz")
-    python_fix = None if python_dependencies_ok else DoctorFix("Install Kannon Python dependencies into .venv", install_command_parts())
-    return [
-        DoctorCheck("Python", True, sys.executable, "required runtime", required=True),
-        DoctorCheck(
-            "PyYAML",
-            YAML_IMPORT_ERROR is None,
-            "import yaml",
-            "required for kannon.yaml cache files",
-            required=True,
-            fix=python_fix,
-        ),
-        DoctorCheck(
-            "Pillow",
-            PIL_IMPORT_ERROR is None,
-            "import PIL",
-            "required for thumbnails and terminal previews",
-            required=True,
-            fix=python_fix,
-        ),
-        DoctorCheck(
-            "PyMuPDF",
-            import_available("fitz"),
-            "import fitz",
-            "recommended primary PDF renderer",
-            fix=python_fix,
-        ),
-        DoctorCheck(
-            "pdftoppm",
-            shutil.which("pdftoppm") is not None,
-            shutil.which("pdftoppm") or "not found",
-            "optional Poppler PDF fallback",
-            fix=system_package_fix("poppler-utils", "poppler"),
-        ),
-        DoctorCheck(
-            "pdfinfo",
-            shutil.which("pdfinfo") is not None,
-            shutil.which("pdfinfo") or "not found",
-            "optional Poppler PDF metadata",
-            fix=system_package_fix("poppler-utils", "poppler"),
-        ),
-        DoctorCheck(
-            "chafa",
-            shutil.which("chafa") is not None,
-            shutil.which("chafa") or "not found",
-            "recommended terminal graphics renderer",
-            fix=system_package_fix("chafa", "chafa"),
-        ),
-        DoctorCheck(
-            "xdg-open",
-            shutil.which("xdg-open") is not None,
-            shutil.which("xdg-open") or "not found",
-            "optional x shortcut opener",
-            fix=system_package_fix("xdg-utils", None),
-        ),
-    ]
-
-
-def system_package_fix(debian_package: str, brew_package: str | None) -> DoctorFix | None:
-    if shutil.which("apt"):
-        return DoctorFix(f"Install {debian_package} with apt", ["sudo", "apt", "install", debian_package])
-    if shutil.which("dnf"):
-        return DoctorFix(f"Install {debian_package} with dnf", ["sudo", "dnf", "install", debian_package])
-    if brew_package and shutil.which("brew"):
-        return DoctorFix(f"Install {brew_package} with Homebrew", ["brew", "install", brew_package])
-    return None
-
-
-def run_doctor_repairs(checks: list[DoctorCheck]) -> bool:
-    repairs: list[DoctorFix] = []
-    seen: set[tuple[str, ...]] = set()
-    for check in checks:
-        if check.fix is None:
-            continue
-        key = tuple(check.fix.command)
-        if key not in seen:
-            repairs.append(check.fix)
-            seen.add(key)
-    if not repairs:
-        return False
-    print("Available repair command(s):")
-    for fix in repairs:
-        print(f"  - {fix.label}: {fix.command_text()}")
-    print()
-    if not sys.stdin.isatty():
-        print("Not prompting because stdin is not interactive. Run kannon --doctor in a terminal to apply repairs.")
-        return False
-    ran_any = False
-    for fix in repairs:
-        if confirm(f"Run {fix.label}? [{fix.command_text()}]"):
-            run_repair_command(fix)
-            ran_any = True
-        else:
-            print(f"Skipped: {fix.label}")
-    print()
-    return ran_any
-
-
-def confirm(prompt: str) -> bool:
-    while True:
-        try:
-            answer = input(f"{prompt} [y/N] ").strip().lower()
-        except EOFError:
-            return False
-        if answer in {"y", "yes"}:
-            return True
-        if answer in {"", "n", "no"}:
-            return False
-        print("Please answer y or n.")
-
-
-def run_repair_command(fix: DoctorFix) -> None:
-    print(f"Running: {fix.command_text()}")
-    try:
-        subprocess.run(fix.command, check=True)
-    except FileNotFoundError as exc:
-        print(f"error: command not found: {exc.filename}", file=sys.stderr)
-    except subprocess.CalledProcessError as exc:
-        print(f"error: repair command failed with exit status {exc.returncode}: {fix.command_text()}", file=sys.stderr)
-    else:
-        print(f"Completed: {fix.label}")
 
 
 def discover_documents(paths: Iterable[Path]) -> list[Path]:
@@ -627,10 +458,6 @@ def print_dependency_warnings(documents: list[Path]) -> None:
         )
 
 
-def import_available(module_name: str) -> bool:
-    return importlib.util.find_spec(module_name) is not None
-
-
 def format_dependency_notice(
     summary: str,
     consequences: list[str],
@@ -647,50 +474,6 @@ def format_dependency_notice(
     if details:
         parts.extend(["  details:", f"    {details}"])
     return "\n".join(parts)
-
-
-def load_cache(cache_path: Path) -> dict[str, Any]:
-    if not cache_path.exists():
-        return {}
-    try:
-        with cache_path.open("r", encoding="utf-8") as handle:
-            data = yaml.safe_load(handle) or {}
-    except OSError as exc:
-        print(f"warning: cannot read cache {cache_path}: {exc}; rebuilding cache.", file=sys.stderr)
-        return {}
-    except yaml.YAMLError as exc:
-        print(f"warning: cannot parse cache {cache_path}: {exc}; rebuilding cache.", file=sys.stderr)
-        return {}
-    if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
-        print(f"warning: ignoring unsupported cache format in {cache_path}; rebuilding cache.", file=sys.stderr)
-        return {}
-    return data
-
-
-def save_cache(cache_path: Path, records: list[dict[str, Any]], thumbnail_size: int) -> None:
-    payload = {
-        "version": CACHE_VERSION,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "thumbnail_size": thumbnail_size,
-        "documents": records,
-    }
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with cache_path.open("w", encoding="utf-8") as handle:
-            yaml.safe_dump(payload, handle, sort_keys=False, allow_unicode=False, width=100)
-    except OSError as exc:
-        raise SystemExit(
-            "\n".join(
-                [
-                    f"Kannon could not write the cache file: {cache_path}",
-                    f"Reason: {exc}",
-                    "Consequence: thumbnails and metadata cannot be saved for reuse.",
-                    "Actions:",
-                    "  - Choose a writable cache path with --cache /path/to/kannon.yaml",
-                    "  - Check directory permissions and available disk space.",
-                ]
-            )
-        ) from exc
 
 
 def build_records(
@@ -805,19 +588,19 @@ def record_is_current(record: dict[str, Any], stat: os.stat_result, thumbnail_si
 def index_document(document: Path, stat: os.stat_result, thumbnail_size: int) -> dict[str, Any]:
     suffix = document.suffix.lower()
     if suffix in PDF_EXTENSIONS:
-        metadata, image = render_pdf(document, thumbnail_size)
+        metadata, image, preview_text = render_pdf(document, thumbnail_size)
         kind = "pdf"
     elif suffix in MARKDOWN_EXTENSIONS:
-        metadata, image = render_markdown(document, thumbnail_size)
+        metadata, image, preview_text = render_markdown(document, thumbnail_size)
         kind = "markdown"
     elif suffix in RTF_EXTENSIONS:
-        metadata, image = render_rtf(document, thumbnail_size)
+        metadata, image, preview_text = render_rtf(document, thumbnail_size)
         kind = "rtf"
     elif suffix in DOCX_EXTENSIONS:
-        metadata, image = render_docx(document, thumbnail_size)
+        metadata, image, preview_text = render_docx(document, thumbnail_size)
         kind = "docx"
     elif suffix in ODT_EXTENSIONS:
-        metadata, image = render_odt(document, thumbnail_size)
+        metadata, image, preview_text = render_odt(document, thumbnail_size)
         kind = "odt"
     else:
         raise ValueError(f"unsupported document type: {suffix}")
@@ -840,6 +623,7 @@ def index_document(document: Path, stat: os.stat_result, thumbnail_size: int) ->
             "owner_user": owner,
         },
         "metadata": compact_metadata(metadata),
+        "text_preview": preview_text[:6000],
         "thumbnail": {
             "media_type": "image/png",
             "encoding": "base64",
@@ -869,6 +653,7 @@ def error_record(document: Path, stat: os.stat_result, exc: Exception) -> dict[s
             "owner_user": owner,
         },
         "metadata": error_metadata(exc),
+        "text_preview": "",
     }
     if owner and owner != getpass.getuser():
         record["user_name"] = owner
@@ -918,7 +703,7 @@ def format_unexpected_error(document: Path, exc: Exception) -> str:
     )
 
 
-def render_pdf(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image]:
+def render_pdf(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image, str]:
     try:
         return render_pdf_with_pymupdf(document, thumbnail_size)
     except ModuleNotFoundError as exc:
@@ -927,13 +712,14 @@ def render_pdf(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Ima
         return render_pdf_with_poppler(document, thumbnail_size, pymupdf_missing=True)
 
 
-def render_pdf_with_pymupdf(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image]:
+def render_pdf_with_pymupdf(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image, str]:
     import fitz
 
     with fitz.open(document) as pdf:
         if pdf.page_count < 1:
             raise ValueError("PDF has no pages")
         page = pdf.load_page(0)
+        preview_text = page.get_text("text") or ""
         rect = page.rect
         scale = thumbnail_size / max(rect.width, rect.height)
         scale = min(max(scale, 0.1), 4.0)
@@ -948,14 +734,14 @@ def render_pdf_with_pymupdf(document: Path, thumbnail_size: int) -> tuple[dict[s
                 "page_1_size_points": f"{rect.width:.1f} x {rect.height:.1f}",
             }
         )
-        return metadata, image
+        return metadata, image, preview_text
 
 
 def render_pdf_with_poppler(
     document: Path,
     thumbnail_size: int,
     pymupdf_missing: bool = False,
-) -> tuple[dict[str, Any], Image.Image]:
+) -> tuple[dict[str, Any], Image.Image, str]:
     if not shutil.which("pdftoppm"):
         raise missing_pdf_renderer_error(pymupdf_missing=pymupdf_missing)
     metadata = pdfinfo_metadata(document)
@@ -997,7 +783,8 @@ def render_pdf_with_poppler(
         image = Image.open(image_path).convert("RGB")
         image.thumbnail((thumbnail_size, thumbnail_size), Image.Resampling.LANCZOS)
     metadata.setdefault("renderer", "poppler-utils")
-    return metadata, image
+    preview_text = "\n".join(f"{title_key(str(key))}: {value}" for key, value in metadata.items())
+    return metadata, image, preview_text
 
 
 def missing_pdf_renderer_error(pymupdf_missing: bool) -> KannonError:
@@ -1073,7 +860,7 @@ def pdfinfo_metadata(document: Path) -> dict[str, Any]:
     return metadata
 
 
-def render_markdown(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image]:
+def render_markdown(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image, str]:
     text = document.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     title = markdown_title(lines) or document.stem
@@ -1085,10 +872,10 @@ def render_markdown(document: Path, thumbnail_size: int) -> tuple[dict[str, Any]
         "renderer": "colored-pillow-markdown",
     }
     image = draw_markdown_page(lines[:80], thumbnail_size, title)
-    return metadata, image
+    return metadata, image, text
 
 
-def render_rtf(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image]:
+def render_rtf(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image, str]:
     raw = document.read_text(encoding="utf-8", errors="replace")
     text = rtf_to_text(raw)
     lines = text.splitlines()
@@ -1099,10 +886,10 @@ def render_rtf(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Ima
         "word_count": len(re.findall(r"\S+", text)),
         "renderer": "lightweight-rtf-text-preview",
     }
-    return metadata, draw_text_page(lines[:80], thumbnail_size, title, accent="#9f1239", kind="RTF")
+    return metadata, draw_text_page(lines[:80], thumbnail_size, title, accent="#9f1239", kind="RTF"), text
 
 
-def render_docx(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image]:
+def render_docx(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image, str]:
     try:
         with zipfile.ZipFile(document) as archive:
             text = docx_document_text(archive)
@@ -1130,10 +917,10 @@ def render_docx(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Im
             "renderer": "stdlib-docx-xml-preview",
         }
     )
-    return metadata, draw_text_page(lines[:80], thumbnail_size, str(title), accent="#0f766e", kind="DOCX")
+    return metadata, draw_text_page(lines[:80], thumbnail_size, str(title), accent="#0f766e", kind="DOCX"), text
 
 
-def render_odt(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image]:
+def render_odt(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Image.Image, str]:
     try:
         with zipfile.ZipFile(document) as archive:
             text = odt_document_text(archive)
@@ -1161,7 +948,7 @@ def render_odt(document: Path, thumbnail_size: int) -> tuple[dict[str, Any], Ima
             "renderer": "stdlib-odt-xml-preview",
         }
     )
-    return metadata, draw_text_page(lines[:80], thumbnail_size, str(title), accent="#6d28d9", kind="ODT")
+    return metadata, draw_text_page(lines[:80], thumbnail_size, str(title), accent="#6d28d9", kind="ODT"), text
 
 
 def markdown_title(lines: list[str]) -> str | None:
@@ -1668,25 +1455,75 @@ def display_path(path: Path) -> str:
         return str(path)
 
 
-def choose_render_mode(args: argparse.Namespace) -> RenderMode:
-    forced = [flag for flag, enabled in {"--ansi": args.ansi, "--sixel": args.sixel, "--chafa": args.chafa}.items() if enabled]
+def available_render_modes(args: argparse.Namespace) -> list[RenderMode]:
+    modes = [RenderMode("text", "text only")]
+    if shutil.which("chafa") and not args.no_chafa:
+        modes.extend(
+            [
+                RenderMode("chafa", "chafa symbols", chafa_format="symbols"),
+                RenderMode("chafa", "chafa sixels", chafa_format="sixels"),
+                RenderMode("chafa", "chafa kitty", chafa_format="kitty"),
+                RenderMode("chafa", "chafa iterm", chafa_format="iterm"),
+                RenderMode("chafa", "chafa ansi", chafa_format="ansi"),
+            ]
+        )
+    if terminal_supports_sixel() or args.sixel:
+        modes.append(RenderMode("sixel", "built-in sixel"))
+    modes.append(RenderMode("ansi", "built-in ANSI"))
+    return modes
+
+
+def initial_render_mode_index(args: argparse.Namespace, modes: list[RenderMode]) -> int:
+    forced = [
+        flag
+        for flag, enabled in {
+            "--ansi": args.ansi,
+            "--sixel": args.sixel,
+            "--chafa": args.chafa,
+            "--text": args.text,
+        }.items()
+        if enabled
+    ]
     if len(forced) > 1:
-        raise SystemExit("--ansi, --sixel, and --chafa are mutually exclusive")
+        raise SystemExit("--ansi, --sixel, --chafa, and --text are mutually exclusive")
     if args.chafa and args.no_chafa:
         raise SystemExit("--chafa and --no-chafa are mutually exclusive")
+    if args.text:
+        return render_mode_index(modes, "text")
     if args.chafa:
         if not shutil.which("chafa"):
             raise SystemExit(chafa_missing_message())
-        return RenderMode("chafa", forced=True)
+        return render_mode_index(modes, "chafa", chafa_format=args.chafa_format)
     if args.ansi:
-        return RenderMode("ansi", forced=True)
+        return render_mode_index(modes, "ansi")
     if args.sixel:
-        return RenderMode("sixel", forced=True)
-    if not args.no_chafa and shutil.which("chafa"):
-        return RenderMode("chafa")
-    if terminal_supports_sixel():
-        return RenderMode("sixel")
-    return RenderMode("ansi")
+        return render_mode_index(modes, "sixel")
+    for preferred in (("chafa", "symbols"), ("sixel", None), ("ansi", None), ("text", None)):
+        index = maybe_render_mode_index(modes, preferred[0], preferred[1])
+        if index is not None:
+            return index
+    return 0
+
+
+def render_mode_index(modes: list[RenderMode], name: str, chafa_format: str | None = None) -> int:
+    index = maybe_render_mode_index(modes, name, chafa_format)
+    if index is None:
+        raise SystemExit(f"render mode is not available: {name}")
+    return index
+
+
+def maybe_render_mode_index(modes: list[RenderMode], name: str, chafa_format: str | None = None) -> int | None:
+    for index, mode in enumerate(modes):
+        if mode.name != name:
+            continue
+        if chafa_format is not None and mode.chafa_format != chafa_format:
+            continue
+        return index
+    return None
+
+
+def cycle_render_mode(modes: list[RenderMode], current: int, delta: int) -> int:
+    return (current + delta) % len(modes)
 
 
 def chafa_missing_message() -> str:
@@ -1720,18 +1557,42 @@ def terminal_supports_sixel() -> bool:
     return any(indicators)
 
 
-def run_tui(records: list[dict[str, Any]], mode: RenderMode, per_page: int, use_nerd: bool) -> None:
+def run_tui(
+    records: list[dict[str, Any]],
+    modes: list[RenderMode],
+    mode_index: int,
+    per_page: int,
+    use_nerd: bool,
+) -> None:
     index = 0
     with RawTerminal() as terminal:
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
         try:
             while True:
+                mode = modes[mode_index]
                 render_page(records, mode, start_index=index, per_page=per_page, use_nerd=use_nerd)
                 key = read_key()
                 if key in {"q", "Q", "\x03", "\x04"}:
                     break
+                if key in {"m", "M", "\t", "backtab"}:
+                    mode_index = cycle_render_mode(modes, mode_index, -1 if key in {"M", "backtab"} else 1)
+                    continue
+                if key == "?":
+                    show_help_popup(terminal)
+                    continue
+                if key == "/":
+                    match = prompt_search(records, index, terminal)
+                    if match is not None:
+                        index = match
+                    continue
+                if key in {"r", "R"}:
+                    records[index] = refresh_record(records[index], terminal)
+                    continue
                 if key in {"x", "X"}:
+                    open_record_external(records[index], terminal)
+                    continue
+                if key in {"\r", "\n"}:
                     open_record_external(records[index], terminal)
                     continue
                 if key in {"e", "E"}:
@@ -1750,7 +1611,7 @@ def run_tui(records: list[dict[str, Any]], mode: RenderMode, per_page: int, use_
             sys.stdout.flush()
 
 
-def run_grid_tui(records: list[dict[str, Any]], mode: RenderMode, use_nerd: bool) -> None:
+def run_grid_tui(records: list[dict[str, Any]], modes: list[RenderMode], mode_index: int, use_nerd: bool) -> None:
     selected = 0
     show_popup = False
     with RawTerminal() as terminal:
@@ -1758,6 +1619,7 @@ def run_grid_tui(records: list[dict[str, Any]], mode: RenderMode, use_nerd: bool
         sys.stdout.flush()
         try:
             while True:
+                mode = modes[mode_index]
                 render_grid(records, mode, selected=selected, use_nerd=use_nerd, show_popup=show_popup)
                 key = read_key()
                 if key in {"q", "Q", "\x03", "\x04", "esc"}:
@@ -1768,7 +1630,25 @@ def run_grid_tui(records: list[dict[str, Any]], mode: RenderMode, use_nerd: bool
                 if key == " ":
                     show_popup = not show_popup
                     continue
+                if key in {"m", "M", "\t", "backtab"}:
+                    mode_index = cycle_render_mode(modes, mode_index, -1 if key in {"M", "backtab"} else 1)
+                    continue
+                if key == "?":
+                    show_help_popup(terminal)
+                    continue
+                if key == "/":
+                    match = prompt_search(records, selected, terminal)
+                    if match is not None:
+                        selected = match
+                        show_popup = False
+                    continue
+                if key in {"r", "R"}:
+                    records[selected] = refresh_record(records[selected], terminal)
+                    continue
                 if key in {"x", "X"}:
+                    open_record_external(records[selected], terminal)
+                    continue
+                if key in {"\r", "\n"}:
                     open_record_external(records[selected], terminal)
                     continue
                 if key in {"e", "E"}:
@@ -1858,6 +1738,81 @@ def edit_record_terminal(record: dict[str, Any], terminal: "RawTerminal | None" 
         enter_tui_screen(terminal)
 
 
+def refresh_record(record: dict[str, Any], terminal: "RawTerminal | None" = None) -> dict[str, Any]:
+    path_text = str(record.get("path_abs") or record.get("path") or "")
+    path = Path(path_text).expanduser()
+    if not path_text or not path.exists():
+        notify_tui_message("Cannot refresh document because its source path is missing.", terminal)
+        return record
+    thumbnail_size = int(record.get("thumbnail", {}).get("max_edge") or 512) if isinstance(record.get("thumbnail"), dict) else 512
+    try:
+        return index_document(path, path.stat(), thumbnail_size)
+    except Exception as exc:
+        notify_tui_message(f"Cannot refresh {path}: {type(exc).__name__}: {exc}", terminal)
+        return record
+
+
+def prompt_search(records: list[dict[str, Any]], start_index: int, terminal: "RawTerminal | None" = None) -> int | None:
+    leave_tui_screen(terminal)
+    try:
+        query = input("Search documents: ").strip()
+    except EOFError:
+        query = ""
+    finally:
+        enter_tui_screen(terminal)
+    if not query:
+        return None
+    match = find_record(records, query, start_index + 1)
+    if match is None:
+        notify_tui_message(f"No match for: {query}", terminal)
+    return match
+
+
+def find_record(records: list[dict[str, Any]], query: str, start_index: int = 0) -> int | None:
+    if not records:
+        return None
+    needle = query.casefold()
+    for offset in range(len(records)):
+        index = (start_index + offset) % len(records)
+        if needle in searchable_record_text(records[index]):
+            return index
+    return None
+
+
+def searchable_record_text(record: dict[str, Any]) -> str:
+    parts = [
+        record.get("title"),
+        record.get("kind"),
+        record.get("path"),
+        record.get("path_abs"),
+        record.get("text_preview"),
+    ]
+    metadata = record.get("metadata", {})
+    if isinstance(metadata, dict):
+        parts.extend(metadata.values())
+    return "\n".join(str(part) for part in parts if part is not None).casefold()
+
+
+def show_help_popup(terminal: "RawTerminal | None" = None) -> None:
+    notify_tui_message(
+        "\n".join(
+            [
+                "Kannon keys",
+                "  arrows/j/k/h/l: navigate",
+                "  m or Tab: next render mode",
+                "  M or Shift-Tab: previous render mode",
+                "  /: search title, path, metadata, and cached text",
+                "  r: refresh selected document in memory",
+                "  Space: toggle metadata popup in grid mode",
+                "  Enter or x: open with xdg-open",
+                "  e: edit text-source documents",
+                "  q: quit",
+            ]
+        ),
+        terminal,
+    )
+
+
 def is_editable_text_record(record: dict[str, Any], path: Path) -> bool:
     kind = str(record.get("kind") or "").lower()
     if kind in EDITABLE_TEXT_KINDS:
@@ -1935,6 +1890,8 @@ def read_key() -> str:
     if seq != "[":
         return "esc"
     tail = sys.stdin.read(1)
+    if tail == "Z":
+        return "backtab"
     mapping = {
         "A": "up",
         "B": "down",
@@ -1955,8 +1912,10 @@ def render_page(
 ) -> None:
     terminal = shutil.get_terminal_size((100, 30))
     visible = records[start_index : start_index + per_page]
-    if mode.name == "chafa":
-        render_chafa_screen(records, visible, terminal, start_index, per_page, use_nerd)
+    if mode.name == "text":
+        render_text_screen(records, visible, terminal, start_index, per_page, use_nerd)
+    elif mode.name == "chafa":
+        render_chafa_screen(records, visible, terminal, start_index, per_page, use_nerd, mode)
     elif mode.name == "sixel":
         render_sixel_screen(records, visible, terminal, start_index, per_page, use_nerd)
     else:
@@ -1997,7 +1956,7 @@ def render_grid(
         draw_metadata_popup(records[selected], terminal, selected, len(records), use_nerd)
     sys.stdout.write(
         f"\x1b[{terminal.lines};1H"
-        f"{grid_status_bar(selected, len(records), mode.name, terminal.columns, show_popup, use_nerd)}"
+        f"{grid_status_bar(selected, len(records), mode.label, terminal.columns, show_popup, use_nerd)}"
     )
     sys.stdout.flush()
 
@@ -2022,11 +1981,13 @@ def draw_grid_cell(
     image_height = max(1, height - 3)
     body_top = top + 1
     body_left = left + 1
-    if not image:
+    if mode.name == "text":
+        lines = compact_record_text(record, image_height, width - 2, use_nerd)
+    elif not image:
         sys.stdout.write(f"\x1b[{body_top};{body_left}H(no thumbnail)")
         return
-    if mode.name == "chafa":
-        output = image_to_chafa(image, image_width, image_height)
+    elif mode.name == "chafa":
+        output = image_to_chafa(image, image_width, image_height, mode.chafa_format or "symbols")
         lines = output.splitlines()
     else:
         lines = image_to_ansi_lines(image, image_width, image_height)
@@ -2064,7 +2025,7 @@ def grid_status_bar(
 ) -> str:
     icon = "󰆼 " if use_nerd else ""
     popup = "metadata popup open, Space/Esc closes" if show_popup else "Space metadata, arrows move"
-    text = f"{icon}[grid/{mode}] selected {selected + 1}/{total} {popup}, e edits, x opens, q quits"
+    text = f"{icon}[grid/{mode}] selected {selected + 1}/{total} {popup}, m/Tab mode, / search, ? help, q quits"
     text = truncate_plain(text, width)
     return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"
 
@@ -2093,6 +2054,34 @@ def draw_metadata_popup(
         )
 
 
+def render_text_screen(
+    records: list[dict[str, Any]],
+    visible: list[dict[str, Any]],
+    terminal: os.terminal_size,
+    start_index: int,
+    per_page: int,
+    use_nerd: bool,
+) -> None:
+    sys.stdout.write("\x1b[2J\x1b[H")
+    slot_height = preview_slot_height(terminal.lines, per_page)
+    for offset, record in enumerate(visible):
+        top = offset * slot_height + 1
+        draw_terminal_header(record, terminal.columns, top, use_nerd)
+        body_top = top + 1
+        body_rows = max(1, slot_height - 2)
+        for row_offset, line in enumerate(compact_record_text(record, body_rows, terminal.columns, use_nerd)):
+            row = body_top + row_offset
+            if row >= top + slot_height:
+                break
+            sys.stdout.write(f"\x1b[{row};1H{truncate_plain(line, terminal.columns)}")
+    footer_row = terminal.lines
+    sys.stdout.write(
+        f"\x1b[{footer_row};1H"
+        f"{status_bar(start_index, len(records), per_page, 'text only', terminal.columns, use_nerd)}"
+    )
+    sys.stdout.flush()
+
+
 def render_chafa_screen(
     records: list[dict[str, Any]],
     visible: list[dict[str, Any]],
@@ -2100,6 +2089,7 @@ def render_chafa_screen(
     start_index: int,
     per_page: int,
     use_nerd: bool,
+    mode: RenderMode,
 ) -> None:
     sys.stdout.write("\x1b[2J\x1b[H")
     slot_height = preview_slot_height(terminal.lines, per_page)
@@ -2113,7 +2103,7 @@ def render_chafa_screen(
         body_top = top + 1
         image = record_image(record)
         if image:
-            output = image_to_chafa(image, image_cols, image_rows)
+            output = image_to_chafa(image, image_cols, image_rows, mode.chafa_format or "symbols")
             for row, line in enumerate(output.splitlines(), start=body_top):
                 if row >= top + slot_height:
                     break
@@ -2130,7 +2120,7 @@ def render_chafa_screen(
     footer_row = terminal.lines
     sys.stdout.write(
         f"\x1b[{footer_row};1H"
-        f"{status_bar(start_index, len(records), per_page, 'chafa', terminal.columns, use_nerd)}"
+        f"{status_bar(start_index, len(records), per_page, mode.label, terminal.columns, use_nerd)}"
     )
     sys.stdout.flush()
 
@@ -2170,7 +2160,7 @@ def render_sixel_screen(
     footer_row = terminal.lines
     sys.stdout.write(
         f"\x1b[{footer_row};1H"
-        f"{status_bar(start_index, len(records), per_page, 'sixel', terminal.columns, use_nerd)}"
+        f"{status_bar(start_index, len(records), per_page, mode.label, terminal.columns, use_nerd)}"
     )
     sys.stdout.flush()
 
@@ -2203,7 +2193,7 @@ def render_ansi_screen(
             right = meta[row] if row < len(meta) else ""
             sys.stdout.write(left + "\x1b[0m" + padding + "  " + truncate_plain(right, meta_width) + "\n")
     sys.stdout.write(
-        "\x1b[0m" + status_bar(start_index, len(records), per_page, "ansi", terminal.columns, use_nerd) + "\n"
+        "\x1b[0m" + status_bar(start_index, len(records), per_page, mode.label, terminal.columns, use_nerd) + "\n"
     )
     sys.stdout.flush()
 
@@ -2219,6 +2209,31 @@ def record_image(record: dict[str, Any]) -> Image.Image | None:
         return Image.open(io.BytesIO(base64.b64decode(data, validate=True))).convert("RGB")
     except (OSError, ValueError, base64.binascii.Error):
         return None
+
+
+def compact_record_text(record: dict[str, Any], max_rows: int, width: int, use_nerd: bool) -> list[str]:
+    lines: list[str] = []
+    meta_budget = min(max_rows, 7)
+    lines.extend(metadata_lines(record, None, None, width, use_nerd)[:meta_budget])
+    preview = str(record.get("text_preview") or "").strip()
+    if preview:
+        if lines and len(lines) < max_rows:
+            lines.append("")
+        for raw in preview.splitlines():
+            if len(lines) >= max_rows:
+                break
+            stripped = raw.strip()
+            if not stripped:
+                if lines and lines[-1] != "":
+                    lines.append("")
+                continue
+            for wrapped in textwrap.wrap(stripped, width=max(8, width)) or [""]:
+                if len(lines) >= max_rows:
+                    break
+                lines.append(wrapped)
+    if not lines:
+        lines.append("(no text preview)")
+    return [truncate_plain(line, width) for line in lines[:max_rows]]
 
 
 def metadata_lines(
@@ -2334,7 +2349,7 @@ def status_bar(start_index: int, total: int, per_page: int, mode: str, width: in
     nav_icon = "󰁔 " if use_nerd else ""
     text = (
         f"{nav_icon}[{mode}] showing {start_index + 1}-{end_index}/{total} "
-        f"per-page={per_page} arrows/j/k page, Home/End jump, e edits, x opens, q quits"
+        f"per-page={per_page} arrows/j/k page, m/Tab mode, / search, ? help, Enter/x opens, q quits"
     )
     text = truncate_plain(text, width)
     return f"\x1b[7m{text}{' ' * max(0, width - len(text))}\x1b[0m"
@@ -2373,7 +2388,7 @@ def fit_image(image: Image.Image, max_width: int, max_height: int) -> Image.Imag
     return image
 
 
-def image_to_chafa(image: Image.Image, width_chars: int, max_rows: int) -> str:
+def image_to_chafa(image: Image.Image, width_chars: int, max_rows: int, chafa_format: str) -> str:
     if not shutil.which("chafa"):
         return "\n".join(image_to_ansi_lines(image, width_chars, max_rows))
     with tempfile.NamedTemporaryFile(suffix=".png") as handle:
@@ -2381,7 +2396,7 @@ def image_to_chafa(image: Image.Image, width_chars: int, max_rows: int) -> str:
         command = [
             "chafa",
             "--format",
-            "symbols",
+            chafa_format,
             "--colors",
             "full",
             "--dither",
