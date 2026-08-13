@@ -416,7 +416,8 @@ Cached records are reused when the source file size, source `mtime_ns`, and
 configured thumbnail size still match. Use `--refresh` to force regeneration.
 In the TUI, changed files are refreshed automatically unless `--watch off` is
 set. If a watched file is deleted, Kannon keeps the last cached preview but marks
-the record as stale in metadata.
+the record as stale in metadata. If the file reappears under the same path while
+watching, Kannon restores the record on the next discovery pass.
 
 ## Metadata
 

@@ -16,6 +16,7 @@ from kannon.cli import (
     discover_new_records,
     refresh_changed_records,
     restore_selected_index,
+    revived_record_indices,
     selected_record_path,
     status_bar,
 )
@@ -171,7 +172,7 @@ def test_discover_new_records_adds_supported_files_and_updates_cache(tmp_path: P
         assert [record["title"] for record in records] == ["First", "Second"]
         cached = load_cache(cache_path, yaml)
         assert [document["title"] for document in cached["documents"]] == ["First", "Second"]
-        assert "Added 1 new document." in status.current()
+        assert "Added or restored 1 document." in status.current()
     finally:
         watcher.close()
 
@@ -208,6 +209,35 @@ def test_discover_new_records_keeps_error_records_known(tmp_path: Path) -> None:
         watcher.last_discovery = 0.0
         assert discover_new_records(watcher, records, [tmp_path], cache_path, 128, "title", False, status) is False
         assert [record["path_abs"] for record in records].count(str(broken.resolve())) == 1
+    finally:
+        watcher.close()
+
+
+def test_discover_new_records_restores_recreated_missing_file(tmp_path: Path) -> None:
+    document = tmp_path / "revived.md"
+    cache_path = tmp_path / "kannon.yaml"
+    record = {
+        "path_abs": str(document),
+        "path": str(document),
+        "kind": "markdown",
+        "title": "revived",
+        "metadata": {"source_missing": True, "warning": "Source file is missing; this preview is stale."},
+        "source": {"missing": True},
+        "text_preview": "# Old",
+    }
+    records = [record]
+    watcher = DocumentWatcher(records, "poll", 0.1)
+    status = StatusMessage()
+    try:
+        document.write_text("# Revived\n\nBack again.\n", encoding="utf-8")
+        watcher.last_discovery = 0.0
+        assert revived_record_indices(records) == [0]
+        assert discover_new_records(watcher, records, [tmp_path], cache_path, 128, "title", False, status) is True
+        assert records[0]["title"] == "Revived"
+        assert records[0]["metadata"].get("source_missing") is None
+        assert records[0]["source"].get("missing") is None
+        cached = load_cache(cache_path, yaml)
+        assert cached["documents"][0]["title"] == "Revived"
     finally:
         watcher.close()
 

@@ -1804,10 +1804,12 @@ def discover_new_records(
     if watcher is None or not watcher.should_discover():
         return False
     known = known_record_paths(records)
-    new_documents = [document for document in discover_documents(paths) if str(document) not in known]
-    if not new_documents:
+    revived = revived_record_indices(records)
+    documents = discover_documents(paths)
+    new_documents = [document for document in documents if str(document) not in known]
+    if not new_documents and not revived:
         return False
-    added = 0
+    added = refresh_revived_records(watcher, records, revived)
     for document in new_documents:
         try:
             stat = document.stat()
@@ -1828,9 +1830,9 @@ def discover_new_records(
     suffix = "" if added == 1 else "s"
     try:
         write_cache(cache_path, records, thumbnail_size, yaml)
-        status.show(f"Added {added} new document{suffix}.")
+        status.show(f"Added or restored {added} document{suffix}.")
     except SystemExit as exc:
-        status.show(f"Added {added} new document{suffix}, but cache write failed: {exc}", ttl=8.0)
+        status.show(f"Added or restored {added} document{suffix}, but cache write failed: {exc}", ttl=8.0)
     return True
 
 
@@ -1849,6 +1851,36 @@ def known_record_paths(records: list[dict[str, Any]]) -> set[str]:
         except OSError:
             pass
     return known
+
+
+def revived_record_indices(records: list[dict[str, Any]]) -> list[int]:
+    revived: list[int] = []
+    for index, record in enumerate(records):
+        metadata = record.get("metadata", {})
+        source = record.get("source", {})
+        if not isinstance(metadata, dict) or metadata.get("source_missing") is not True:
+            continue
+        if not isinstance(source, dict) or source.get("missing") is not True:
+            continue
+        path_text = str(record.get("path_abs") or record.get("path") or "")
+        if path_text and Path(path_text).expanduser().exists():
+            revived.append(index)
+    return revived
+
+
+def refresh_revived_records(
+    watcher: DocumentWatcher,
+    records: list[dict[str, Any]],
+    revived: list[int],
+) -> int:
+    refreshed = 0
+    for index in revived:
+        new_record = refresh_record(records[index], None, notify=False)
+        if new_record is not records[index]:
+            records[index] = new_record
+            watcher.update_record(index, new_record)
+            refreshed += 1
+    return refreshed
 
 
 def selected_record_path(records: list[dict[str, Any]], index: int) -> str | None:
