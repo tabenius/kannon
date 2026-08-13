@@ -215,13 +215,38 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_tui or not (sys.stdin.isatty() and sys.stdout.isatty()):
             render_grid(records, modes[mode_index], selected=0, use_nerd=use_nerd, show_popup=False)
             return 0
-        run_grid_tui(records, modes, mode_index, use_nerd, cache_path, args.size, args.watch, args.watch_interval)
+        run_grid_tui(
+            records,
+            modes,
+            mode_index,
+            use_nerd,
+            cache_path,
+            args.size,
+            args.watch,
+            args.watch_interval,
+            paths,
+            args.sort,
+            not args.ascending,
+        )
         return 0
     if args.no_tui or not (sys.stdin.isatty() and sys.stdout.isatty()):
         render_page(records, modes[mode_index], start_index=0, per_page=args.per_page, use_nerd=use_nerd)
         return 0
 
-    run_tui(records, modes, mode_index, args.per_page, use_nerd, cache_path, args.size, args.watch, args.watch_interval)
+    run_tui(
+        records,
+        modes,
+        mode_index,
+        args.per_page,
+        use_nerd,
+        cache_path,
+        args.size,
+        args.watch,
+        args.watch_interval,
+        paths,
+        args.sort,
+        not args.ascending,
+    )
     return 0
 
 
@@ -1422,6 +1447,9 @@ def run_tui(
     thumbnail_size: int,
     watch_mode: str,
     watch_interval: float,
+    watch_paths: list[Path],
+    sort_key: str,
+    sort_descending: bool,
 ) -> None:
     index = 0
     watcher = make_watcher(records, watch_mode, watch_interval)
@@ -1436,6 +1464,18 @@ def run_tui(
         try:
             while True:
                 dirty = refresh_changed_records(watcher, records, cache_path, thumbnail_size, status) or dirty
+                current_path = selected_record_path(records, index)
+                dirty = discover_new_records(
+                    watcher,
+                    records,
+                    watch_paths,
+                    cache_path,
+                    thumbnail_size,
+                    sort_key,
+                    sort_descending,
+                    status,
+                ) or dirty
+                index = restore_selected_index(records, current_path, index)
                 message = status.current()
                 if message != last_message:
                     dirty = True
@@ -1509,6 +1549,9 @@ def run_grid_tui(
     thumbnail_size: int,
     watch_mode: str,
     watch_interval: float,
+    watch_paths: list[Path],
+    sort_key: str,
+    sort_descending: bool,
 ) -> None:
     selected = 0
     show_popup = False
@@ -1524,6 +1567,18 @@ def run_grid_tui(
         try:
             while True:
                 dirty = refresh_changed_records(watcher, records, cache_path, thumbnail_size, status) or dirty
+                current_path = selected_record_path(records, selected)
+                dirty = discover_new_records(
+                    watcher,
+                    records,
+                    watch_paths,
+                    cache_path,
+                    thumbnail_size,
+                    sort_key,
+                    sort_descending,
+                    status,
+                ) or dirty
+                selected = restore_selected_index(records, current_path, selected)
                 message = status.current()
                 if message != last_message:
                     dirty = True
@@ -1734,6 +1789,82 @@ def refresh_changed_records(
             status.show(f"Auto-refreshed {refreshed} changed document{suffix}, but cache write failed: {exc}", ttl=8.0)
         return True
     return False
+
+
+def discover_new_records(
+    watcher: DocumentWatcher | None,
+    records: list[dict[str, Any]],
+    paths: list[Path],
+    cache_path: Path,
+    thumbnail_size: int,
+    sort_key: str,
+    sort_descending: bool,
+    status: StatusMessage,
+) -> bool:
+    if watcher is None or not watcher.should_discover():
+        return False
+    known = known_record_paths(records)
+    new_documents = [document for document in discover_documents(paths) if str(document) not in known]
+    if not new_documents:
+        return False
+    added = 0
+    for document in new_documents:
+        try:
+            stat = document.stat()
+        except OSError:
+            continue
+        try:
+            records.append(index_document(document, stat, thumbnail_size))
+        except KannonError as exc:
+            records.append(error_record(document, stat, exc))
+        except Exception as exc:
+            records.append(error_record(document, stat, exc))
+        watcher.update_record(len(records) - 1, records[-1])
+        added += 1
+    if not added:
+        return False
+    records[:] = sort_records(records, sort_key, descending=sort_descending)
+    watcher.rebuild(records)
+    suffix = "" if added == 1 else "s"
+    try:
+        write_cache(cache_path, records, thumbnail_size, yaml)
+        status.show(f"Added {added} new document{suffix}.")
+    except SystemExit as exc:
+        status.show(f"Added {added} new document{suffix}, but cache write failed: {exc}", ttl=8.0)
+    return True
+
+
+def known_record_paths(records: list[dict[str, Any]]) -> set[str]:
+    known: set[str] = set()
+    for record in records:
+        path_text = str(record.get("path_abs") or "")
+        if path_text:
+            known.add(path_text)
+            continue
+        relative = str(record.get("path") or "")
+        if not relative:
+            continue
+        try:
+            known.add(str(Path(relative).expanduser().resolve()))
+        except OSError:
+            pass
+    return known
+
+
+def selected_record_path(records: list[dict[str, Any]], index: int) -> str | None:
+    if not records or index < 0 or index >= len(records):
+        return None
+    return str(records[index].get("path_abs") or records[index].get("path") or "") or None
+
+
+def restore_selected_index(records: list[dict[str, Any]], path: str | None, fallback: int) -> int:
+    if not records:
+        return 0
+    if path:
+        for index, record in enumerate(records):
+            if path == str(record.get("path_abs") or record.get("path") or ""):
+                return index
+    return min(max(0, fallback), len(records) - 1)
 
 
 def update_watcher_record(watcher: DocumentWatcher | None, index: int, record: dict[str, Any]) -> None:

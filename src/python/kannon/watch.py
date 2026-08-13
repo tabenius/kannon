@@ -108,6 +108,7 @@ class DocumentWatcher:
             raise ValueError(f"unsupported watch mode: {mode}")
         self.interval = max(0.1, interval)
         self.last_poll = 0.0
+        self.last_discovery = time.monotonic()
         self.signatures = [record_signature(record) for record in records]
         self.backend: InotifyBackend | None = None
         self.message: str | None = None
@@ -152,10 +153,35 @@ class DocumentWatcher:
                 except OSError:
                     pass
 
+    def rebuild(self, records: list[dict[str, Any]]) -> None:
+        self.signatures = [record_signature(record) for record in records]
+        if self.backend is None:
+            return
+        self.backend.close()
+        self.backend = None
+        try:
+            self.backend = InotifyBackend()
+        except OSError:
+            return
+        for index, record in enumerate(records):
+            path = record_path(record)
+            if path is not None and path.exists():
+                try:
+                    self.backend.add_path(path, index)
+                except OSError:
+                    pass
+
     def mark_seen(self, index: int, record: dict[str, Any]) -> None:
         while len(self.signatures) <= index:
             self.signatures.append(("missing", 0, 0))
         self.signatures[index] = current_signature(record)
+
+    def should_discover(self) -> bool:
+        now = time.monotonic()
+        if now - self.last_discovery < self.interval:
+            return False
+        self.last_discovery = now
+        return True
 
     def _poll_changed(self, records: list[dict[str, Any]]) -> set[int]:
         changed: set[int] = set()

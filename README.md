@@ -276,8 +276,9 @@ TTYs.
 - `x`: execute `xdg-open` for the current document.
 - `q`: quit.
 
-While the TUI is open, Kannon watches the indexed files for changes and
-auto-refreshes changed records in the cache. On Linux it uses native inotify
+While the TUI is open, Kannon watches indexed files for changes, auto-refreshes
+changed records in the cache, and periodically adds newly created supported
+documents from the scanned files or directories. On Linux it uses native inotify
 plus periodic polling by default. On other platforms, or when inotify is not
 available, it uses polling. Use `--watch off` to disable this, `--watch poll` to
 force polling, or `--watch-interval 2.5` to make polling less frequent. The TUI

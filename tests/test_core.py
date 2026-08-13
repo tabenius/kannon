@@ -13,7 +13,10 @@ from kannon.cli import (
     grid_status_bar,
     index_document,
     mark_missing_source,
+    discover_new_records,
     refresh_changed_records,
+    restore_selected_index,
+    selected_record_path,
     status_bar,
 )
 from kannon.deps import ImportStatus, doctor_checks, run_doctor_repairs
@@ -151,6 +154,72 @@ def test_refresh_changed_records_updates_changed_markdown_and_cache(tmp_path: Pa
         assert "Auto-refreshed 1 changed document." in status.current()
     finally:
         watcher.close()
+
+
+def test_discover_new_records_adds_supported_files_and_updates_cache(tmp_path: Path) -> None:
+    first = tmp_path / "first.md"
+    second = tmp_path / "second.md"
+    cache_path = tmp_path / "kannon.yaml"
+    first.write_text("# First\n", encoding="utf-8")
+    records = [index_document(first, first.stat(), 128)]
+    watcher = DocumentWatcher(records, "poll", 0.1)
+    status = StatusMessage()
+    try:
+        second.write_text("# Second\n", encoding="utf-8")
+        watcher.last_discovery = 0.0
+        assert discover_new_records(watcher, records, [tmp_path], cache_path, 128, "title", False, status) is True
+        assert [record["title"] for record in records] == ["First", "Second"]
+        cached = load_cache(cache_path, yaml)
+        assert [document["title"] for document in cached["documents"]] == ["First", "Second"]
+        assert "Added 1 new document." in status.current()
+    finally:
+        watcher.close()
+
+
+def test_discover_new_records_ignores_known_and_unsupported_files(tmp_path: Path) -> None:
+    first = tmp_path / "first.md"
+    unsupported = tmp_path / "plain.txt"
+    cache_path = tmp_path / "kannon.yaml"
+    first.write_text("# First\n", encoding="utf-8")
+    unsupported.write_text("plain\n", encoding="utf-8")
+    record = index_document(first, first.stat(), 128)
+    watcher = DocumentWatcher([record], "poll", 0.1)
+    status = StatusMessage()
+    try:
+        watcher.last_discovery = 0.0
+        assert discover_new_records(watcher, [record], [tmp_path], cache_path, 128, "title", False, status) is False
+        assert not cache_path.exists()
+    finally:
+        watcher.close()
+
+
+def test_discover_new_records_keeps_error_records_known(tmp_path: Path) -> None:
+    good = tmp_path / "good.md"
+    broken = tmp_path / "broken.docx"
+    cache_path = tmp_path / "kannon.yaml"
+    good.write_text("# Good\n", encoding="utf-8")
+    broken.write_bytes(b"not a zip")
+    records = [index_document(good, good.stat(), 128)]
+    watcher = DocumentWatcher(records, "poll", 0.1)
+    status = StatusMessage()
+    try:
+        watcher.last_discovery = 0.0
+        assert discover_new_records(watcher, records, [tmp_path], cache_path, 128, "title", False, status) is True
+        watcher.last_discovery = 0.0
+        assert discover_new_records(watcher, records, [tmp_path], cache_path, 128, "title", False, status) is False
+        assert [record["path_abs"] for record in records].count(str(broken.resolve())) == 1
+    finally:
+        watcher.close()
+
+
+def test_selected_index_restores_after_sorting() -> None:
+    records = [
+        {"path_abs": "/tmp/b.md", "title": "B"},
+        {"path_abs": "/tmp/a.md", "title": "A"},
+    ]
+    selected = selected_record_path(records, 0)
+    records[:] = sort_records(records, "title", descending=False)
+    assert restore_selected_index(records, selected, 0) == 1
 
 
 def test_status_bars_can_show_transient_messages() -> None:
